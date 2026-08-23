@@ -53,8 +53,8 @@ int hulingTugtog = 0; // 0 = wala pa, 15 = LOS, 16 = Good, 17 = Warning
 
 // >>>>>>>>>>>>>>>>>> NTP & WIFI CONFIG (PALITAN ITO) <<<<<<<<<<<<<<<<<<
 
-const char* ssid = "Rail Gridon";
-const char* password = "Rustygrace31@@";
+const char* ssid = "Rusty";
+const char* password = "12345678";
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 28800; // GMT+8 for Philippines
 const int   daylightOffset_sec = 0;
@@ -753,7 +753,6 @@ long getDistance() {
 // Sa lahat ng ibang states (STATE_MOVING, STATE_SLEEPING_IR, STATE_DANCING, atbp.)
 // i-i-IGNORE ang command para hindi ito makipag-agawan sa kung anumang ginagawa
 // ng robot sa main FSM sa oras na yun.
-
 void handleCommand() {
   if (!server.hasArg("dir")) {
     server.send(400, "text/plain", "Bad Request");
@@ -803,11 +802,48 @@ void handleCommand() {
     digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
     ledcWrite(CH_A, FACE_TURN_SPEED); ledcWrite(CH_B, FACE_TURN_SPEED);
     roboEyes.anim_confused();
+  } else if (dir == "DANCE") {
+    currentState = STATE_DANCING;
+    danceStartTime = millis();
+    lastDanceStepTime = millis();
+    myDFPlayer.play(12);
+    danceStep = 0;
+    atrasAbanteCycleCount = 0;
+    roboEyes.setMood(HAPPY);
+    roboEyes.anim_laugh();
+    Serial.println("💃 Face-Track: DANCE MODE ACTIVATED");
   } else if (dir == "STOP" || dir == "SEARCH") {
     stopBot();
     roboEyes.setMood(DEFAULT);
-  }
-
+  } else if (dir == "SHAKING") {
+    stopBot();
+    roboEyes.setMood(ANGRY);
+    roboEyes.anim_laugh();
+    shakeDuration = 3000;
+    shakeStartTime = millis();
+    currentState = STATE_SHAKING;
+    Serial.println("🤖 Face-Track: SHAKING MODE ACTIVATED");
+  } else if (dir == "OPM") {
+    hulingTugtog = 0; // Importante: Reset para bumoses agad
+    Serial.println("🖥️ Face-Track: RUSTECH OPM DISPLAY STARTED (30s block)");
+    unsigned long lockStartTime = millis();
+    while (millis() - lockStartTime < 30000) { // 30 seconds lock
+        showRustechOPM();
+        delay(100); // Konting hinga para sa I2C
+        yield();
+    }
+    Serial.println("🖥️ Face-Track: RUSTECH OPM DISPLAY FINISHED");
+  } else if (dir == "LASER_ON") {
+    digitalWrite(2, HIGH); // Bukas ang Laser
+    Serial.println("🔦 Face-Track: LASER ON");
+    myDFPlayer.play(13);
+    playBootSound_NB();
+} else if (dir == "LASER_OFF") {
+    digitalWrite(2, LOW); // Patay ang Laser
+    Serial.println("🔦 Face-Track: LASER OFF");
+    myDFPlayer.play(14);
+    playSleepBeep_NB();
+}
   lastFaceCommandTime = millis();
   server.send(200, "text/plain", "OK: " + dir);
 }
@@ -1593,6 +1629,55 @@ if (cmdID == 82) {
   systemReboot();
 }
 
+// 30. DISPLAY ROBOT IP ADDRESS (ID 49)
+if (cmdID == 49) {
+  // Guard: kung nagpapakita na ng IP, huwag na ulit i-retrigger/i-reset
+  // ang timer kahit paulit-ulit pang mabasa ang parehong cmdID ng voice module
+  if (!(isDisplayingNumber && currentState == STATE_EXPRESSION)) {
+    Serial.println("📶 Command: Display IP Address");
+    stopBot();
+    playBootSound_NB();
+
+    display.clearDisplay();
+    display.setTextColor(SH110X_WHITE);
+    display.setTextSize(1);
+    display.setCursor(8, 2);
+    display.print("ROBOT IP ADDRESS:");
+    display.drawFastHLine(0, 13, 128, SH110X_WHITE);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      String ipStr = WiFi.localIP().toString();
+
+      // Dynamic text size - lumiliit kapag mahaba ang IP (hal. galing hotspot)
+      int fontSize = (ipStr.length() <= 10) ? 2 : 1;
+      int charWidth = (fontSize == 2) ? 12 : 6;
+      int textWidthPx = ipStr.length() * charWidth;
+      int xPos = (128 - textWidthPx) / 2;
+      if (xPos < 0) xPos = 0;
+
+      display.setTextSize(fontSize);
+      display.setCursor(xPos, 24);
+      display.print(ipStr);
+
+      display.setTextSize(1);
+      display.setCursor(2, 48);
+      display.print("SSID: ");
+      display.print(ssid);
+    } else {
+      display.setTextSize(2);
+      display.setCursor(10, 25);
+      display.print("NO WIFI");
+    }
+
+    display.display();
+
+    isDisplayingNumber = true;
+    currentState = STATE_EXPRESSION;
+    cryingStartTime = millis();
+  }
+  cmdID = 0;
+}
+
 //  ================ VOICE COMMANDS FOR SMART HOME (FORWARD TO S3) ==================
     else if (cmdID == 6) {
         stopBot();
@@ -1660,7 +1745,7 @@ if (cmdID == 82) {
       break;
     }
     
- case STATE_BOOT_WAIT: {
+case STATE_BOOT_WAIT: {
   bool pirDetected = (distance > 0 && distance < PRESENCE_TRIGGER_CM);
   static unsigned long lastPIRTriggerTime = 0;
 
@@ -1679,21 +1764,21 @@ if (cmdID == 82) {
   }
 
   // === SAFETY CHECK - LAGING NAKA-ON kahit naka-connect ang FaceRobot app ===
+  // Ngayon kasama na ang ULTRASONIC (distansya) bukod sa pit sensors
   bool bwLeftPit = digitalRead(IR_SENSOR_LEFT);
   bool bwRightPit = digitalRead(IR_SENSOR_RIGHT);
+  bool bwTooCloseUltra = (distance > 0 && distance < 5);
 
-  if (bwLeftPit == HIGH || bwRightPit == HIGH) {
+  if (bwLeftPit == HIGH || bwRightPit == HIGH || bwTooCloseUltra) {
     currentBaseSpeed = 180;
     reverse();
     roboEyes.setMood(ANGRY);
-    lastFaceCommandTime = 0;
+    lastFaceCommandTime = 0;  // i-clear para di agad bumalik sa face-follow habang aatras pa
   }
   else {
     bool faceTrackingActive = (millis() - lastFaceCommandTime < FACE_COMMAND_TIMEOUT);
 
     if (!faceTrackingActive) {
-      // ITINAGO natin dito ang speed-set + ledcWrite - GAGANA LANG kapag
-      // talagang gagamitin ang autonomous greeter/distance logic
       currentBaseSpeed = 180;
 
       if (distance > 0 && distance < 5) {
@@ -1718,8 +1803,6 @@ if (cmdID == 82) {
         roboEyes.setMood(DEFAULT);
       }
     }
-    // else: face-tracking commands ang bahala sa direction/speed, huwag na i-touch dito —
-    // dati dito ang problema: laging naiuuwi ang duty=180 dito kahit STOP na ang huling utos
   }
 
   if (!isDisplayingNumber) {
@@ -2264,6 +2347,7 @@ void handleSecurityGuard() {
     // 5. Opsyonal: I-set ang state sa IDLE para maghintay ng command
     // currentState = STATE_IDLE; 
   }
+
 }
 
 // ====== FUNCTION PARA SA GEMINI OPM MODE (ID 100) ======
