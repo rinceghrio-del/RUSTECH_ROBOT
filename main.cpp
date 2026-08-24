@@ -859,8 +859,8 @@ void loop() {
                           // ay naka-gate sa loob ng handleCommand() (STATE_BOOT_WAIT lang)
   if (millis() - lastTelemetryTime > 200) {
         int currentDistance = getDistance(); // Palitan mo ng actual function mo pang-read ng sensor
-        SerialBT.print("T:");
-        SerialBT.println(currentDistance);
+        //SerialBT.print("T:");
+        //SerialBT.println(currentDistance);
         lastTelemetryTime = millis();
     }
 
@@ -1679,7 +1679,7 @@ if (cmdID == 49) {
 }
 
 //  ================ VOICE COMMANDS FOR SMART HOME (FORWARD TO S3) ==================
-    else if (cmdID == 6) {
+   /* else if (cmdID == 6) {
         stopBot();
       playBootSound_NB(); // Beep feedback
       roboEyes.setMood(ANGRY);
@@ -1715,7 +1715,7 @@ if (cmdID == 49) {
       
       // Opsyonal: Mood ng robot kapag nag-OFF
       roboEyes.setMood(ANGRY);
-    }
+    }*/
     lastVoiceTime = millis(); // I-update ang cooldown
   }
 }
@@ -2316,8 +2316,8 @@ if (millis() - lastTelemetryTime > telemetryInterval) {
 
     // 2. I-send ang data gamit ang format na "T:Value"
     // Mahalaga ang "T:" dahil yan ang hinahanap ng C++ App natin.
-    SerialBT.print("T:"); 
-    SerialBT.println(telemetryDist); 
+    //SerialBT.print("T:"); 
+    //SerialBT.println(telemetryDist); 
 }
 
 }// End of void loop()
