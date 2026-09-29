@@ -1,5 +1,5 @@
 // IP: 192.168.1.4 | MAC: c8f74240bcb4=======================================================================================
-// ROBOT SKETCH: ULTIMATE VERSION V5.3.3
+// ROBOT SKETCH: ULTIMATE VERSION V5.3.9
 // W/ PERMANENT IR SLEEP, NON-BLOCKING AVOIDANCE, NTP TIME, & 1-MINUTE ALARM CLOCK
 // Modified: Add SLEEP IR Wake Reaction (STATE_SLEEP_ALERT) - Rustech patch
 // MODIFIED: Merged conflicting STATE_SLEEP with STATE_SLEEPING_IR, Fixed IR Logic.
@@ -7,6 +7,26 @@
 // Modified: Added Music Player Functionality w/ DFRo
 // bot DFPlayer Mini & DF2301Q Voice Module
 // MERGED: Added FaceRobot Android app HTTP control (/command?dir=X), active ONLY in STATE_BOOT_WAIT
+// V5.3.9: CAMERA OBSTACLE AVOIDANCE (depth model sa FaceRobot app) habang STATE_MOVING:
+//         - /ping ay sumasagot na ng "PONG|<STATE>" para malaman ng app kung naka-MOVING ang robot.
+//         - Bagong commands (tinatanggap lang habang MOVING / AVOIDING): NAV_LEFT, NAV_RIGHT, NAV_BACK, NAV_CLEAR
+//           (+ optional &servo=<angle>). Ang ESP32 pa rin ang may huling desisyon: ultrasonic/IR avoidance
+//           ang laging mauuna, at kapag walang bagong hint sa loob ng NAV_HINT_TIMEOUT_MS, tuloy-tuloy lang ang forward.
+// V5.3.8: Tinanggal ang 30s auto-stop ng STATE_MOVING (AUTO ay tuloy-tuloy hanggang FORCE_STOP / voice "stop").
+//         Ibalik sa true ang MOVING_AUTO_STOP_ENABLED kung gusto ulit ng 30s stop + PIR wait.
+//         FIX boot crash (Guru Meditation LoadProhibited) kapag hindi agad naka-connect ang WiFi:
+//         HINDI na ino-off ang WiFi radio sa Offline Mode (may ESP-NOW + Bluetooth na gumagamit nito),
+//         at dinagdagan ang connect attempts (10 -> 20, lalabas agad kapag naka-connect na).
+// V5.3.7 FIX: Ang AUTO (app/Bluetooth/alarm) ay agad na natatapos ang moving timer at hindi tumutuloy.
+//         Sanhi: ang 'now' ay kinuha sa simula ng loop(), pero ang movementStartTime ay nase-set ng
+//         millis() sa loob ng server.handleClient() -> mas bago pa kaysa 'now' -> unsigned underflow
+//         (now - movementStartTime = napakalaking numero) -> agad "60s done". Ngayon signed compare na.
+// V5.3.6: AUTO command mula sa app ay tinatanggap na sa ANUMANG state (dati STATE_BOOT_WAIT lang kaya nai-IGNORE).
+//         Non-blocking na ang time check (dating hanggang 5s ang block ng getLocalTime kapag walang NTP sync).
+// V5.3.5: Kapag na-disconnect ang app (10s walang ping), babalik na sa roboEyes ang OLED.
+// V5.3.4 FIX: Inayos ang updateEyes() (dating nag-i-infinite recursion kaya hindi nagbo-boot).
+//             Kapag naka-link ang FaceRobot app, IP address na lang ang lalabas sa OLED.
+//             Ang roboEyes.update() ay DAPAT nasa loob LANG ng updateEyes(); lahat ng iba ay updateEyes() na.
 // =======================================================================================
 
 #include <Wire.h>
@@ -22,6 +42,17 @@ static unsigned long lastVoiceTime = 0;
 const unsigned long VOICE_COOLDOWN = 2000;
 BluetoothSerial SerialBT;
 unsigned long lastTelemetryTime = 0;
+
+#include <ESP32Servo.h>
+Servo liftServo;
+#define SERVO_PIN 15
+#define SERVO_MIN_ANGLE 0
+#define SERVO_MAX_ANGLE 110   // physical limit - lagpas dito, babangga sa floor
+int currentServoAngle = 0;    // simulan sa pinakababa (folded/down position)
+int targetServoAngle = 0;     // ang gustong marating ng servo
+unsigned long lastServoStepTime = 0;
+const unsigned long SERVO_STEP_INTERVAL_MS = 1; // pagitan ng bawat hakbang
+const int SERVO_STEP_DEG = 1;                    // 1° bawat 25ms = ~40°/s
 
 #include <HardwareSerial.h>      // Para sa Serial2 (Pins 16 & 17)
 #include <DFRobotDFPlayerMini.h> // Ang library ng MP3 module
@@ -71,6 +102,12 @@ unsigned long lastFaceCommandTime = 0;
 const unsigned long FACE_COMMAND_TIMEOUT = 600; // ms - kung wala nang bagong command dito, babalik sa autonomous mode
 const int FACE_TURN_SPEED = 130;     // mas mabagal na turn - dating 220 masyadong bilis, kaya nagwawild
 const int FACE_FORWARD_SPEED = 140;  // mas mabagal ding forward/backward para sa follow
+bool appLinked = false;                 // true = may nakausap nang app -> IP-only ang OLED
+unsigned long lastAppContactTime = 0;
+unsigned long lastIpDrawTime = 0;
+bool ipScreenNeedsDraw = true;
+const unsigned long IP_REDRAW_INTERVAL = 2000;
+const unsigned long APP_LINK_TIMEOUT_MS = 10000; // 10s walang ping/command mula sa app = disconnected -> balik sa roboEyes (0 = laging IP-only)
 // ========================= ALARM CONFIGURATION =========================
 
 const int ALARM_HOUR = 06;
@@ -126,6 +163,12 @@ unsigned long pauseDuration = 800; // Hinto ng 0.8 seconds bago lumingon
 #define CH_A 4
 #define CH_B 5
 
+// Hiwalay na LEDC channel para sa buzzer - dating gamit ng tone()/noTone() ay
+// pareho ang LEDC hardware timers ng Servo library (channels 0-7), kaya
+// nagkakabanggaan/nasisira ang 50Hz timing ng servo. Ang channel 10 ay nasa
+// ibang timer group na, kaya ligtas na hiwalay sa servo (0-7) at motors (4,5).
+#define BUZZER_LEDC_CHANNEL 6   // high-speed group, timer3 — hiwalay sa servo (low-speed 0-3) at motors (timer2)
+
 // ========================= STATE MACHINE & TIMERS =========================
 
 enum RobotState {
@@ -156,6 +199,12 @@ unsigned long lastBluetoothTime = 0;
 int currentBaseSpeed = 160; // Ito ang default speed
 int currentTurnSpeed = 220; // Default turn speed
 const unsigned long MOVEMENT_DURATION = 30000;
+// ---------------- V5.3.9: CAMERA NAV HINTS (mula sa FaceRobot app) ----------------
+uint8_t navHint = 0;                       // 0 = wala, 1 = LEFT, 2 = RIGHT, 3 = BACK, 4 = CLEAR
+unsigned long navHintTime = 0;             // millis() nang huling dumating ang hint
+const unsigned long NAV_HINT_TIMEOUT_MS = 700; // kapag mas luma pa dito ang hint, ituring na expired (forward na ulit)
+const int NAV_TURN_SPEED = 150;            // bilis ng spin habang camera-nav (mas mabagal kaysa avoidance turn)
+const bool MOVING_AUTO_STOP_ENABLED = false; // V5.3.8: false = tuloy-tuloy ang STATE_MOVING (walang 30s stop). true = dating behavior
 const unsigned long PIR_ACTIVATION_DELAY = 3000;
 const long detectionCooldown = 5000;
 const int PRESENCE_TRIGGER_CM = 30; // Distansya (cm) na magsasabing "may tao" — kapalit ng PIR sensor
@@ -179,7 +228,7 @@ unsigned long lastCuriousBeep = 0; // For curious beeps
 bool isPirDetectionActive = false;
 unsigned long shakeStartTime = 0; // For shaking state
 
-// ULTRASONIC LAG FIX VARIABLES
+
 
 unsigned long lastDistanceReadTime = 0;
 const unsigned long DISTANCE_READ_INTERVAL = 200;
@@ -285,29 +334,45 @@ void showRustechOPM();
 void systemReboot();
 void handle_bluetooth_data();
 void handleCommand(); // FaceRobot Android app HTTP command handler (STATE_BOOT_WAIT only)
+void drawIpScreen();
+void onAppContact();
+void updateEyes();
+void setServoAngle(int angle); // Servo control function
+void updateServo();
 
 // ========================= BUZZER CONTROL (NON-BLOCKING) =========================
 
+// Kapalit ng built-in tone()/noTone() - gumagamit ng sariling LEDC channel
+// (BUZZER_LEDC_CHANNEL) para hindi na ito makipag-agawan sa mga LEDC timer na
+// ginagamit ng Servo library o ng motors.
+void buzzTone(int freq) {
+  ledcWriteTone(BUZZER_LEDC_CHANNEL, freq);
+}
+void buzzOff() {
+  ledcWriteTone(BUZZER_LEDC_CHANNEL, 0); // explicit na patayin ang tone, hindi lang duty=0
+  ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+}
+
 void startTone(int frequency, unsigned long duration) {
   isPlayingCurious = false;
-  tone(BUZZER_PIN, frequency, duration);
+  buzzTone(frequency);
   toneEndTime = millis() + duration;
 }
 
 void updateBuzzer() {
   unsigned long now = millis();
   if (toneEndTime > 0 && now >= toneEndTime) {
-    noTone(BUZZER_PIN);
+    buzzOff();
     toneEndTime = 0;
   }
 
   if (isPlayingCurious && now >= lastToneStartTime + curiousPattern[currentToneIndex][1] + 50) {
     currentToneIndex++;
     if (currentToneIndex < 4) {
-      tone(BUZZER_PIN, curiousPattern[currentToneIndex][0], curiousPattern[currentToneIndex][1]);
+      buzzTone(curiousPattern[currentToneIndex][0]);
       lastToneStartTime = now;
     } else {
-      noTone(BUZZER_PIN);
+      buzzOff();
       isPlayingCurious = false;
     }
   }
@@ -316,14 +381,14 @@ void updateBuzzer() {
     if (now >= avoidToneEnd) {
       avoidToneIndex++;
       if (avoidToneIndex >= AVOID_TONE_COUNT) {
-        noTone(BUZZER_PIN);
+        buzzOff();
         isAvoidBeepActive = false;
       } else if (avoidToneIndex == 2) {
-        tone(BUZZER_PIN, glideFreq);
+        buzzTone(glideFreq);
         avoidToneEnd = now + avoidPattern[2][1];
         glideNextUpdate = now + glideInterval;
       } else {
-        tone(BUZZER_PIN, avoidPattern[avoidToneIndex][0], avoidPattern[avoidToneIndex][1]);
+        buzzTone(avoidPattern[avoidToneIndex][0]);
         avoidToneEnd = now + avoidPattern[avoidToneIndex][1];
       }
     }
@@ -331,7 +396,7 @@ void updateBuzzer() {
     if (avoidToneIndex == 2 && now >= glideNextUpdate) {
       if (glideFreq < glideTarget) {
         glideFreq += glideStep;
-        tone(BUZZER_PIN, glideFreq);
+        buzzTone(glideFreq);
       }
       glideNextUpdate = now + glideInterval;
     }
@@ -343,13 +408,13 @@ void updateBuzzer() {
     if (now < alarmTriggerTime + ALARM_DURATION) {
       if ((now % 800) < 400) {
         if (toneEndTime == 0 && !isPlayingCurious && !isAvoidBeepActive) {
-          tone(BUZZER_PIN, ALARM_TONE_FREQ);
+          buzzTone(ALARM_TONE_FREQ);
         }
       } else {
-        noTone(BUZZER_PIN);
+        buzzOff();
       }
     } else {
-      noTone(BUZZER_PIN);
+      buzzOff();
       alarmTriggerTime = 0;
       Serial.println("Alarm tone ended after 2 minute.");
     }
@@ -359,18 +424,20 @@ void updateBuzzer() {
 void playBootSound_NB() {
   int tonesArr[] = {300, 400, 500, 650, 800, 1000};
   for (int i = 0; i < 6; i++) {
-    tone(BUZZER_PIN, tonesArr[i], 80);
+    buzzTone(tonesArr[i]);
     delay(100);
   }
+  buzzOff();
 }
 
 void playSleepBeep_NB() {
   for (int i = 0; i < 2; i++) {
-    tone(BUZZER_PIN, 200, 150);
+    buzzTone(200);
     delay(300);
-    noTone(BUZZER_PIN);
+    buzzOff();
     delay(200);
   }
+  buzzOff();
 }
 
 void playCuriousBeep_NB() {
@@ -378,7 +445,7 @@ void playCuriousBeep_NB() {
   currentToneIndex = 0;
   isPlayingCurious = true;
   lastToneStartTime = millis();
-  tone(BUZZER_PIN, curiousPattern[0][0], curiousPattern[0][1]);
+  buzzTone(curiousPattern[0][0]);
 }
 
 void playAvoidBeep_NB() {
@@ -386,16 +453,33 @@ void playAvoidBeep_NB() {
   isAvoidBeepActive = true;
   avoidToneIndex = 0;
   glideFreq = avoidPattern[2][0];
-  tone(BUZZER_PIN, avoidPattern[0][0], avoidPattern[0][1]);
+  buzzTone(avoidPattern[0][0]);
   avoidToneEnd = millis() + avoidPattern[0][1];
 }
 
 // ========================= TIME DISPLAY FUNCTION (TWO-LINE CENTERED) =========================
 
+// V5.3.6: Non-blocking na kapalit ng getLocalTime(). Ang getLocalTime() ay maghihintay ng hanggang 5 SEGUNDO
+// kapag hindi pa naka-sync ang NTP (hal. walang internet ang WiFi) at tatawagin pa ito bawat loop -
+// dahilan ng matinding lag at pagka-delay ng mga command ng robot.
+bool getLocalTimeNB(struct tm* info) {
+  time_t nowT;
+  time(&nowT);
+  localtime_r(&nowT, info);
+  return info->tm_year > (2016 - 1900);
+}
+
 void displayTime() {
+  // V5.3.4: Kapag naka-link ang app at hindi voice-command ang nag-display (isDisplayingNumber),
+  // IP screen lang ang ipapakita imbes na oras.
+  if (appLinked && !isDisplayingNumber) {
+    updateEyes();
+    return;
+  }
+
   struct tm timeinfo;
 
-  if (!getLocalTime(&timeinfo)) {
+  if (!getLocalTimeNB(&timeinfo)) {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SH110X_WHITE);
@@ -442,14 +526,19 @@ void displayTime() {
 // ========================= ALARM CHECK FUNCTION =========================
 
 void checkAlarm() {
+  // V5.3.6: isang beses lang bawat segundo mag-check (dati bawat loop)
+  static unsigned long lastAlarmCheck = 0;
+  if (millis() - lastAlarmCheck < 1000) return;
+  lastAlarmCheck = millis();
+
   if (WiFi.status() != WL_CONNECTED) return; // Skip alarm check kung offline
   
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return;
+  if (!getLocalTimeNB(&timeinfo)) return;
 
   if (!isAlarmSet) return;
   
-  if (!getLocalTime(&timeinfo)) {
+  if (!getLocalTimeNB(&timeinfo)) {
     return;
   }
 
@@ -477,7 +566,7 @@ void checkAlarm() {
     isAvoidBeepActive = false;
     isPlayingCurious = false;
     toneEndTime = 0;
-    noTone(BUZZER_PIN); // Stop any avoidance beeps
+    buzzOff(); // Stop any avoidance beeps
 
     // WAKE-UP ROUTINE (if sleeping from IR only)
 
@@ -491,6 +580,7 @@ void checkAlarm() {
       isTiredFaceDone = false;
       currentState = STATE_MOVING;
       movementStartTime = millis();
+      ipScreenNeedsDraw = true; // V5.3.4: siguraduhing mag-redraw ang IP screen pagkatapos ng clearDisplay
       Serial.println("Robot WOKE UP via ALARM!");
     } else {
 
@@ -501,6 +591,97 @@ void checkAlarm() {
 }
 
 // ========================= SETUP =========================
+
+void drawIpScreen() {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(8, 2);
+  display.print("ROBOT IP ADDRESS:");
+  display.drawFastHLine(0, 13, 128, SH110X_WHITE);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    String ipStr = WiFi.localIP().toString();
+    int fontSize = (ipStr.length() <= 10) ? 2 : 1;
+    int charWidth = (fontSize == 2) ? 12 : 6;
+    int xPos = (128 - ipStr.length() * charWidth) / 2;
+    if (xPos < 0) xPos = 0;
+    display.setTextSize(fontSize);
+    display.setCursor(xPos, 24);
+    display.print(ipStr);
+    display.setTextSize(1);
+    display.setCursor(2, 48);
+    display.print("SSID: ");
+    display.print(ssid);
+  } else {
+    display.setTextSize(2);
+    display.setCursor(10, 25);
+    display.print("NO WIFI");
+  }
+  display.display();
+}
+
+void onAppContact() {
+  lastAppContactTime = millis();
+  if (!appLinked) {
+    appLinked = true;
+    ipScreenNeedsDraw = true;
+    Serial.println("📱 FaceRobot app linked - OLED eyes OFF, IP only");
+  }
+}
+
+// ========================= updateEyes() - FIXED V5.3.4 =========================
+// PAALALA: DITO LANG DAPAT MANATILI ANG roboEyes.update() sa buong sketch.
+// Kung papalitan mo rin ang roboEyes.update() sa loob nito ng updateEyes(),
+// mag-i-infinite recursion ito at hindi magbo-boot ang robot!
+void updateEyes() {
+  // Kapag may naka-lock na display (numero / IP / oras mula sa voice command), huwag galawin
+  if (isDisplayingNumber) return;
+
+  if (appLinked && APP_LINK_TIMEOUT_MS > 0 && (millis() - lastAppContactTime > APP_LINK_TIMEOUT_MS)) {
+    appLinked = false;
+    display.clearDisplay(); // V5.3.5: burahin ang IP screen bago bumalik ang roboEyes
+    Serial.println("📱 FaceRobot app disconnected - balik sa roboEyes");
+  }
+
+  if (!appLinked) {
+    roboEyes.update();   // <-- ITO LANG ang lugar na dapat may roboEyes.update()
+    return;
+  }
+
+  // May naka-link na app: IP screen lang, hindi eyes
+  if (ipScreenNeedsDraw || (millis() - lastIpDrawTime > IP_REDRAW_INTERVAL)) {
+    drawIpScreen();
+    lastIpDrawTime = millis();
+    ipScreenNeedsDraw = false;
+  }
+}
+
+// V5.3.9: Pangalan ng state para sa /ping reply (para malaman ng app kung MOVING ang robot)
+const char* stateName(RobotState st) {
+  switch (st) {
+    case STATE_BOOT_WAIT: return "BOOT_WAIT";
+    case STATE_MOVING: return "MOVING";
+    case STATE_STOPPED_WAITING_FOR_PIR: return "STOPPED_WAITING_FOR_PIR";
+    case STATE_PIR_ACTIVE_AND_DETECTING: return "PIR_ACTIVE";
+    case STATE_SLEEPING_IR: return "SLEEPING_IR";
+    case STATE_SLEEP_ALERT: return "SLEEP_ALERT";
+    case STATE_AVOIDING_REVERSE: return "AVOIDING_REVERSE";
+    case STATE_AVOIDING_STOP: return "AVOIDING_STOP";
+    case STATE_AVOIDING_TURN: return "AVOIDING_TURN";
+    case STATE_SLEEP_ULTRASONIC_OSC: return "SLEEP_ULTRASONIC_OSC";
+    case STATE_DANCING: return "DANCING";
+    case STATE_SHAKING: return "SHAKING";
+    case STATE_EXPRESSION: return "EXPRESSION";
+    case STATE_MANUAL: return "MANUAL";
+    default: return "UNKNOWN";
+  }
+}
+
+void handlePing() {
+  onAppContact();
+  server.send(200, "text/plain", String("PONG|") + stateName(currentState));
+}
 
 void setup() {
   Serial.begin(115200);
@@ -516,6 +697,13 @@ void setup() {
   } else {
     Serial.println("✅ Bluetooth Ready! Pair mo na sa phone.");
   }
+ESP32PWM::allocateTimer(0);
+ESP32PWM::allocateTimer(1);
+ESP32PWM::allocateTimer(2);
+ESP32PWM::allocateTimer(3);
+liftServo.setPeriodHertz(50);
+liftServo.attach(SERVO_PIN, 500, 2500); // i-adjust base sa totoong range ng unit mo
+liftServo.write(currentServoAngle); // simulan sa DOWN position
 
 //  ==================== ESP-NOW SETUP =========================
 
@@ -581,6 +769,10 @@ void setup() {
   roboEyes.setCuriosity(ON);
 
   pinMode(BUZZER_PIN, OUTPUT);
+  // Buzzer sa sarili nang LEDC channel/timer (hiwalay sa Servo at Motors) para
+  // maiwasan ang conflict na dating sanhi ng biglaang paggalaw/paghinto ng servo.
+  ledcSetup(BUZZER_LEDC_CHANNEL, 2000, 10);
+  ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CHANNEL);
   pinMode(LED_PIN, OUTPUT);
 
   //==== Line-following IR (Pit Detection - Active-HIGH, needs PULLDOWN)
@@ -624,11 +816,11 @@ WiFi.begin(ssid, password);
 
 int connectAttempts = 0;
 // Binawasan natin ang attempts sa 10 para mas mabilis mag-boot sa labas
-while (WiFi.status() != WL_CONNECTED && connectAttempts < 10) { 
+while (WiFi.status() != WL_CONNECTED && connectAttempts < 20) { 
   delay(300); // Binilisan ang delay para hindi halatang naghihintay
   Serial.print(".");
   roboEyes.anim_confused(); // OK lang ito basta hindi masyadong matagal
-  roboEyes.update();
+  updateEyes();
   connectAttempts++;
 }
 
@@ -645,18 +837,22 @@ if (WiFi.status() == WL_CONNECTED) {
   // Gagana lang ang commands na natatanggap dito kapag STATE_BOOT_WAIT
   // ang currentState (tignan ang handleCommand()).
   server.on("/command", handleCommand);
+  server.on("/ping", handlePing);
   server.begin();
   Serial.print("Face-Track HTTP Server Started! IP: ");
   Serial.println(WiFi.localIP());
 } else {
   // Eto ang magic: Kung walang WiFi, patayin ang WiFi radio para makatipid sa battery
   WiFi.disconnect();
-  WiFi.mode(WIFI_OFF); 
-  Serial.println("\nOffline Mode: WiFi disabled to save power.");
+  // V5.3.8: HUWAG i-WIFI_OFF dito - nagdudulot ng "wifi not stop / Failed to deinit Wi-Fi driver"
+  // at Guru Meditation crash dahil naka-init na ang ESP-NOW at Bluetooth. Disconnect lang.
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false);
+  Serial.println("\nOffline Mode: walang WiFi connection (naka-standby ang radio para iwas crash).");
 }
 // >>>>>>>>>>>>>>>>>> END WIFI & NTP SETUP <<<<<<<<<<<<<<<<<<
 
-  noTone(BUZZER_PIN);
+  buzzOff();
   playBootSound_NB();
   roboEyes.setMood(HAPPY);
 
@@ -664,7 +860,7 @@ if (WiFi.status() == WL_CONNECTED) {
   currentState = STATE_BOOT_WAIT;
 
   stopBot();
-  noTone(BUZZER_PIN);
+  buzzOff();
 
 roboEyes.setMood(TIRED);
 roboEyes.setAutoblinker(ON, 8, 5);
@@ -733,6 +929,19 @@ void stopBot() {
   ledcWrite(CH_B, 0);
 }
 
+// V5.3.9: Mabagal na spin para sa camera-nav. Kaparehong pin pattern ng turnLeft()/turnRight(), iba lang ang bilis.
+void navSpin(bool left) {
+  if (left) {
+    digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
+    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+  } else {
+    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
+  }
+  ledcWrite(CH_A, NAV_TURN_SPEED);
+  ledcWrite(CH_B, NAV_TURN_SPEED);
+}
+
 // ========================= ULTRASONIC =========================
 
 long getDistance() {
@@ -760,6 +969,111 @@ void handleCommand() {
   }
 
   String dir = server.arg("dir");
+    onAppContact();
+
+  if (dir == "FORCE_STOP") {
+    myDFPlayer.stop();
+    stopBot();
+    buzzOff();
+    myDFPlayer.play(10); // Play the "Yes Boss" advert
+    navHint = 0; // V5.3.9
+    isMusicActive = false;
+    danceStartTime = 0;
+    digitalWrite(LED_PIN, LOW);
+    ledState = LOW;
+    roboEyes.setMood(DEFAULT);
+    currentState = STATE_BOOT_WAIT;
+    Serial.println("🛑 Face-Track: FORCE STOP (anumang state)");
+    lastFaceCommandTime = millis();
+    server.send(200, "text/plain", "OK: FORCE_STOP");
+    return;
+}
+
+// V5.3.6: AUTO - tinatanggap sa ANUMANG state (hindi na kailangan STATE_BOOT_WAIT).
+// Dati, kapag nasa STATE_PIR_ACTIVE_AND_DETECTING / SHAKING / EXPRESSION / DANCING / SLEEPING ang robot,
+// nai-i-IGNORE ang AUTO kahit narinig ng app, at hindi ito nire-retry ng app.
+else if (dir == "AUTO") {
+    stopBot();
+    digitalWrite(LED_PIN, LOW);
+    ledState = LOW;
+    danceStartTime = 0;
+    isDisplayingNumber = false;
+    ipScreenNeedsDraw = true;
+    isCrying = false;
+    roboEyes.setSweat(OFF);
+    sleepAvoidActive = false;
+    navHint = 0; // V5.3.9
+    isPirDetectionActive = false;
+    isTiredFaceDone = false;
+    consecutiveIrTriggers = 0;
+    currentBaseSpeed = 160;
+    currentTurnSpeed = 220;
+    roboEyes.setMood(DEFAULT);
+    currentState = STATE_MOVING;
+    movementStartTime = millis();
+    lastFaceCommandTime = millis();
+    Serial.println("🤖 Face-Track: AUTO MODE ACTIVATED (any state)");
+    server.send(200, "text/plain", "OK: AUTO");
+    return;
+}
+
+// V5.3.9: CAMERA NAV HINTS (depth model sa FaceRobot app) - tinatanggap lang habang MOVING / AVOIDING.
+// NAV_LEFT  = lumiko pakaliwa (libre ang kaliwa)     NAV_RIGHT = lumiko pakanan (libre ang kanan)
+// NAV_BACK  = dead end / harang sa harap -> avoidance sequence (reverse, pause, turn)
+// NAV_CLEAR = libre ang daan -> forward
+else if (dir.startsWith("NAV_")) {
+    bool navState = (currentState == STATE_MOVING || currentState == STATE_AVOIDING_REVERSE ||
+                     currentState == STATE_AVOIDING_STOP || currentState == STATE_AVOIDING_TURN);
+    if (!navState) {
+      server.send(200, "text/plain", "IGNORED: not in MOVING");
+      return;
+    }
+    if (server.hasArg("servo")) {
+      setServoAngle(server.arg("servo").toInt()); // camera tilt para sa nav scan
+    }
+    if (currentState == STATE_MOVING) {
+      if (dir == "NAV_LEFT") navHint = 1;
+      else if (dir == "NAV_RIGHT") navHint = 2;
+      else if (dir == "NAV_BACK") navHint = 3;
+      else navHint = 4; // NAV_CLEAR
+      navHintTime = millis();
+      static unsigned long lastNavLog = 0;   // debug: isang print bawat 1s lang para hindi mapuno ang Serial
+      if (millis() - lastNavLog > 1000) {
+        lastNavLog = millis();
+        Serial.print("NAV hint received: ");
+        Serial.println(dir);
+      }
+    }
+    server.send(200, "text/plain", "OK: " + dir);
+    return;
+}
+
+else if (dir == "MUSIC_ON") {
+    Serial.println("🎵 Face-Track: MUSIC MODE ON (shuffle)");
+    isMusicActive = true;
+    myDFPlayer.play(3); // Play the first track to initialize
+    delay(2000); // Wait for 2 seconds to ensure the player is ready
+    currentSongNumber = random(1, totalMusicFiles + 1);
+    myDFPlayer.playMp3Folder(currentSongNumber);
+    roboEyes.setMood(HAPPY);
+}
+else if (dir == "MUSIC_OFF") {
+    Serial.println("🎵 Face-Track: MUSIC MODE OFF");
+    isMusicActive = false;
+    myDFPlayer.stop();
+    roboEyes.setMood(DEFAULT);
+}
+else if (dir == "MUSIC_NEXT") {
+    if (isMusicActive) {
+      currentSongNumber++;
+      if (currentSongNumber > totalMusicFiles) currentSongNumber = 1;
+      myDFPlayer.play(3); // Play the first track to initialize
+      delay(2000); // Wait for 2 seconds to ensure the player is ready
+      myDFPlayer.playMp3Folder(currentSongNumber);
+      Serial.print("🎵 Next Track: ");
+      Serial.println(currentSongNumber);
+    }
+}
 
   if (currentState != STATE_BOOT_WAIT) {
     Serial.print("Face-Track Command IGNORED (currentState != STATE_BOOT_WAIT): ");
@@ -773,36 +1087,70 @@ void handleCommand() {
 
   bool leftPit = digitalRead(IR_SENSOR_LEFT) == HIGH;
   bool rightPit = digitalRead(IR_SENSOR_RIGHT) == HIGH;
-  bool tooClose = (currentDistance > 0 && currentDistance < 5);
 
+  // --- DIRECTION & ACTION COMMANDS ---
   if (dir == "FORWARD") {
-    if (!leftPit && !rightPit && !tooClose) {
-      digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
-      digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
-      ledcWrite(CH_A, FACE_FORWARD_SPEED); ledcWrite(CH_B, FACE_FORWARD_SPEED);
-      roboEyes.setMood(HAPPY);
-    } else {
-      Serial.println("⚠️ Forward blocked! Pit or too-close detected.");
+    if (leftPit || rightPit) {
+      Serial.println("⚠️ Forward blocked! Pit detected.");
       stopBot();
       roboEyes.setMood(ANGRY);
     }
-  } else if (dir == "BACKWARD") {
+    else if (currentDistance > 0 && currentDistance < 5) {
+      reverse();
+      roboEyes.setMood(ANGRY);
+    }
+    else if (currentDistance >= 5 && currentDistance < 15) {
+      stopBot();
+      static unsigned long lastFwdBlink = 0;
+      if (millis() - lastFwdBlink > 5000) {
+        roboEyes.anim_laugh();
+        lastFwdBlink = millis();
+      }
+      roboEyes.setMood(HAPPY);
+    }
+    else {
+      digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+      digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+      ledcWrite(CH_A, FACE_FORWARD_SPEED); ledcWrite(CH_B, FACE_FORWARD_SPEED);
+      roboEyes.setMood(DEFAULT);
+    } 
+  } 
+  else if (dir == "GREET") {
+    if (server.hasArg("track")) {
+      int trackNum = server.arg("track").toInt();
+      myDFPlayer.play(trackNum);
+      Serial.print("🔊 Face-Track: GREETING TRACK ");
+      Serial.println(trackNum);
+    }
+  } 
+  else if (dir == "PLAY") {
+    int trackNum = 3;
+    if (server.hasArg("track")) {
+      int trackNum = server.arg("track").toInt();
+      myDFPlayer.play(trackNum);
+      Serial.print("🔊 Face-Track: PLAY TRACK ");
+      Serial.println(trackNum);
+    }
+}
+  else if (dir == "BACKWARD") {
     digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
     digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
     ledcWrite(CH_A, FACE_FORWARD_SPEED); ledcWrite(CH_B, FACE_FORWARD_SPEED);
     roboEyes.setMood(DEFAULT);
-  } else if (dir == "LEFT") {
-    // mirrored (kagaya ng dati) pero FACE_TURN_SPEED na, hindi na currentTurnSpeed
+  } 
+  else if (dir == "LEFT") {
     digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
     digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
     ledcWrite(CH_A, FACE_TURN_SPEED); ledcWrite(CH_B, FACE_TURN_SPEED);
     roboEyes.anim_confused();
-  } else if (dir == "RIGHT") {
+  } 
+  else if (dir == "RIGHT") {
     digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
     digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
     ledcWrite(CH_A, FACE_TURN_SPEED); ledcWrite(CH_B, FACE_TURN_SPEED);
     roboEyes.anim_confused();
-  } else if (dir == "DANCE") {
+  } 
+  else if (dir == "DANCE") {
     currentState = STATE_DANCING;
     danceStartTime = millis();
     lastDanceStepTime = millis();
@@ -812,10 +1160,12 @@ void handleCommand() {
     roboEyes.setMood(HAPPY);
     roboEyes.anim_laugh();
     Serial.println("💃 Face-Track: DANCE MODE ACTIVATED");
-  } else if (dir == "STOP" || dir == "SEARCH") {
+  } 
+  else if (dir == "STOP" || dir == "SEARCH") {
     stopBot();
     roboEyes.setMood(DEFAULT);
-  } else if (dir == "SHAKING") {
+  } 
+  else if (dir == "SHAKING") {
     stopBot();
     roboEyes.setMood(ANGRY);
     roboEyes.anim_laugh();
@@ -823,27 +1173,53 @@ void handleCommand() {
     shakeStartTime = millis();
     currentState = STATE_SHAKING;
     Serial.println("🤖 Face-Track: SHAKING MODE ACTIVATED");
-  } else if (dir == "OPM") {
-    hulingTugtog = 0; // Importante: Reset para bumoses agad
+  }
+  // (Ang AUTO ay hina-handle na sa itaas, bago ang state gate - tignan ang V5.3.6 note)
+  else if (dir == "OPM") {
+    hulingTugtog = 0;
     Serial.println("🖥️ Face-Track: RUSTECH OPM DISPLAY STARTED (30s block)");
     unsigned long lockStartTime = millis();
-    while (millis() - lockStartTime < 30000) { // 30 seconds lock
-        showRustechOPM();
-        delay(100); // Konting hinga para sa I2C
-        yield();
+    while (millis() - lockStartTime < 30000) {
+      showRustechOPM();
+      delay(100);
+      yield();
     }
     Serial.println("🖥️ Face-Track: RUSTECH OPM DISPLAY FINISHED");
-  } else if (dir == "LASER_ON") {
-    digitalWrite(2, HIGH); // Bukas ang Laser
+    ipScreenNeedsDraw = true; // V5.3.4: ibalik agad ang IP screen pagkatapos ng OPM display
+    if (appLinked) lastAppContactTime = millis(); // V5.3.5: nag-block ng 30s, kaya huwag ituring na disconnected ang app
+  } 
+  else if (dir == "LASER_ON") {
+    digitalWrite(2, HIGH);
     Serial.println("🔦 Face-Track: LASER ON");
     myDFPlayer.play(13);
     playBootSound_NB();
-} else if (dir == "LASER_OFF") {
-    digitalWrite(2, LOW); // Patay ang Laser
+  } 
+  else if (dir == "LASER_OFF") {
+    digitalWrite(2, LOW);
     Serial.println("🔦 Face-Track: LASER OFF");
     myDFPlayer.play(14);
     playSleepBeep_NB();
-}
+  }  
+  else if (dir == "LIFT_UP") {
+    setServoAngle(SERVO_MAX_ANGLE);
+    Serial.println("🦾 Face-Track: SERVO LIFT UP");
+  } 
+  else if (dir == "LIFT_DOWN") {
+    setServoAngle(SERVO_MIN_ANGLE);
+    Serial.println("🦾 Face-Track: SERVO LIFT DOWN");
+  }
+
+  // --- SERVO TRACKING CHECK ---
+  if (server.hasArg("servo")) {
+    int servoAngleReq = server.arg("servo").toInt();
+    setServoAngle(servoAngleReq);
+    Serial.print("Servo value received & applied: ");
+    Serial.println(servoAngleReq);
+  } else {
+    Serial.println("Has servo arg? NO");
+  }  
+  
+  // Final update & HTTP Response
   lastFaceCommandTime = millis();
   server.send(200, "text/plain", "OK: " + dir);
 }
@@ -852,17 +1228,12 @@ void handleCommand() {
 
 void loop() {
   unsigned long now = millis();
+  updateServo();
   checkAlarm();
   updateBuzzer();
   handle_bluetooth_data();
   server.handleClient(); // Palaging naka-listen sa FaceRobot app; ang aktwal na pag-galaw
                           // ay naka-gate sa loob ng handleCommand() (STATE_BOOT_WAIT lang)
-  if (millis() - lastTelemetryTime > 200) {
-        int currentDistance = getDistance(); // Palitan mo ng actual function mo pang-read ng sensor
-        //SerialBT.print("T:");
-        //SerialBT.println(currentDistance);
-        lastTelemetryTime = millis();
-    }
 
 //=========== PINAGSAMANG MUSIC & ADVERT LOGIC =================
 if (myDFPlayer.available()) {
@@ -927,7 +1298,7 @@ if (isAdvertPlaying) {
 
 //      if (buttonState == LOW && currentState == STATE_BOOT_WAIT) {
 //  display.clearDisplay();
-//  noTone(BUZZER_PIN);
+//  buzzOff();
 //  playBootSound_NB();
 
 //  roboEyes.setMood(HAPPY);
@@ -979,7 +1350,7 @@ if (isAdvertPlaying) {
     // WAKE-UP/START DANCE ROUTINE
 //    display.clearDisplay();
 //    alarmTriggerTime = 0;
-//    noTone(BUZZER_PIN);
+//    buzzOff();
 //    playBootSound_NB();
 //    roboEyes.setMood(HAPPY);
 //    roboEyes.anim_laugh();
@@ -1089,7 +1460,7 @@ if (isAdvertPlaying) {
 
       alarmTriggerTime = 0;
 
-      noTone(BUZZER_PIN);
+      buzzOff();
       roboEyes.setMood(TIRED);
       roboEyes.setAutoblinker(ON, 8, 5);
       roboEyes.setIdleMode(ON, 2, 2);
@@ -1103,7 +1474,7 @@ if (isAdvertPlaying) {
       consecutiveIrTriggers = 0;
 
       if (!isDisplayingNumber) {
-    roboEyes.update(); 
+    updateEyes(); 
   }
       return;
     }
@@ -1621,6 +1992,8 @@ if (cmdID == 48 || cmdID == 11) { // Pwede mo ring gamitin yung OFF command para
     delay(100); // Konting hinga para sa I2C
     yield();
   }
+  ipScreenNeedsDraw = true; // V5.3.4: ibalik agad ang IP screen pagkatapos ng OPM display
+    if (appLinked) lastAppContactTime = millis(); // V5.3.5: nag-block ng 30s, kaya huwag ituring na disconnected ang app
 }
 
 // 29. reset command (ID 82)
@@ -1731,7 +2104,7 @@ if (cmdID == 49) {
       
       // Kung HINDI numero ang pinapakita, ituloy ang animation ng mata (Smiley o Crying)
       if (!isDisplayingNumber) {
-          roboEyes.update();
+          updateEyes();
       }
 
       // Timer para bumalik sa dati
@@ -1739,6 +2112,7 @@ if (cmdID == 49) {
         roboEyes.setSweat(OFF);
         isCrying = false;
         isDisplayingNumber = false; // Reset ang flag
+        ipScreenNeedsDraw = true;   // V5.3.4: kapag naka-link ang app, ibalik agad ang IP screen
         currentState = STATE_BOOT_WAIT;
         Serial.println("Back to normal mode.");
       }
@@ -1806,7 +2180,7 @@ case STATE_BOOT_WAIT: {
   }
 
   if (!isDisplayingNumber) {
-    roboEyes.update();
+    updateEyes();
   }
 
   break;
@@ -1838,7 +2212,7 @@ if (distance > 0 && distance <= 15) {
     // DITO SA MANUAL, WALANG SENSORS! 
     // Hihintayin lang niya ang susunod na Bluetooth command.
     // Pwede mo lang i-update ang mata dito.
-    roboEyes.update(); 
+    updateEyes(); 
     
     // OPTIONAL: Kung gusto mo bumalik sa auto pag walang pinipindot ng 10 seconds
     
@@ -1885,8 +2259,30 @@ if (distance > 0 && distance <= 15) {
         if (anyAvoidanceTrigger) roboEyes.setMood(ANGRY);
         else roboEyes.setMood(TIRED);
       } else {
-        forward();
-        roboEyes.setMood(HAPPY);
+        // V5.3.9: camera nav hints (signed compare - ang navHintTime ay nase-set sa loob ng handleClient)
+        bool navFresh = (navHint != 0) && ((long)(now - navHintTime) < (long)NAV_HINT_TIMEOUT_MS);
+        if (navFresh && navHint == 3) {
+          // NAV_BACK: kapareho ng sensor avoidance (reverse -> pause -> turn)
+          navHint = 0;
+          stopBot();
+          playAvoidBeep_NB();
+          currentBaseSpeed = 120;
+          currentTurnSpeed = 200;
+          lastEdgeDetected = EDGE_BOTH;
+          avoidanceStartTime = now;
+          currentState = STATE_AVOIDING_REVERSE;
+          roboEyes.setMood(ANGRY);
+          Serial.println("Avoidance: CAMERA BACK");
+        } else if (navFresh && navHint == 1) {
+          navSpin(true);   // lumiko pakaliwa habang libre ang kaliwa
+          roboEyes.setMood(HAPPY);
+        } else if (navFresh && navHint == 2) {
+          navSpin(false);  // lumiko pakanan habang libre ang kanan
+          roboEyes.setMood(HAPPY);
+        } else {
+          forward();
+          roboEyes.setMood(HAPPY);
+        }
 
         if (now - lastCuriousBeep > 5000 && !isPlayingCurious) {
           playCuriousBeep_NB();
@@ -1895,7 +2291,7 @@ if (distance > 0 && distance <= 15) {
         }
       }
 
-      if (now - movementStartTime >= MOVEMENT_DURATION) {
+      if (MOVING_AUTO_STOP_ENABLED && (long)(now - movementStartTime) >= (long)MOVEMENT_DURATION) { // V5.3.7: signed compare - iwas underflow kapag mas bago ang movementStartTime kaysa 'now'
         stopBot();
         pirActivationStartTime = now;
         isPirDetectionActive = false;
@@ -1998,7 +2394,7 @@ if (distance > 0 && distance <= 15) {
         // 1. Face Update
         roboEyes.setMood(ANGRY); 
         if (!isDisplayingNumber) {
-          roboEyes.update(); 
+          updateEyes(); 
         }
 
         // 2. Oscillate left/right quickly (Dapat nasa loob ito ng case)
@@ -2058,7 +2454,7 @@ if (distance > 0 && distance <= 15) {
         }
       }
       if (!isDisplayingNumber) {
-    roboEyes.update(); 
+    updateEyes(); 
 }
       break;
     } // End of STATE_SLEEP_ULTRASONIC_OSC case
@@ -2160,7 +2556,7 @@ if (distance > 0 && distance <= 15) {
             }
             break;
           }
-          roboEyes.update();
+          updateEyes();
           break;
          } // End of STATE_DANCING case
 
@@ -2173,7 +2569,7 @@ if (distance > 0 && distance <= 15) {
         if (currentState != STATE_SLEEP_ALERT) {
           sleepAlertStart = now;
           alarmTriggerTime = 0;
-          noTone(BUZZER_PIN);
+          buzzOff();
           playAvoidBeep_NB();
           roboEyes.anim_confused();
           roboEyes.setAutoblinker(ON, 1, 1);
@@ -2231,7 +2627,7 @@ if (distance > 0 && distance <= 15) {
         }
         roboEyes.setMood(ANGRY);
         if (!isDisplayingNumber) {
-        roboEyes.update(); 
+        updateEyes(); 
       }
 
         // stop after 2 seconds
@@ -2242,7 +2638,7 @@ if (distance > 0 && distance <= 15) {
           roboEyes.anim_confused();
           roboEyes.setMood(TIRED);
           if (!isDisplayingNumber) {
-        roboEyes.update(); 
+        updateEyes(); 
       }
           Serial.println("SLEEP AVOID: DONE");
         }
@@ -2265,7 +2661,7 @@ if (distance > 0 && distance <= 15) {
         }
 
         if (isTiredFaceDone && alarmTriggerTime == 0) {
-          displayTime();
+          displayTime(); // V5.3.4: kapag naka-link ang app, IP screen ang ipapakita (tignan ang displayTime())
         }
       }
       break;
@@ -2280,11 +2676,11 @@ if (distance > 0 && distance <= 15) {
 
   if (currentState != STATE_SLEEPING_IR && currentState != STATE_SLEEP_ALERT) {
     if (!isDisplayingNumber) {
-        roboEyes.update(); 
+        updateEyes(); 
       }
   } else if (!isTiredFaceDone && alarmTriggerTime == 0) {
     if (!isDisplayingNumber) {
-        roboEyes.update(); 
+        updateEyes(); 
       }
   }
 
@@ -2300,6 +2696,7 @@ if (distance > 0 && distance <= 15) {
       Serial.println("I2C Bus Busy or Error - Re-initializing...");
       Wire.begin(); 
       display.begin(0x3C, true);
+      ipScreenNeedsDraw = true; // V5.3.4: mag-redraw pagkatapos ng I2C recovery
     }
   }
  
@@ -2513,4 +2910,21 @@ void systemReboot() {
   
   delay(1000); // Konting pause para mabasa ng user
   ESP.restart(); 
+}
+
+void setServoAngle(int angle) {
+  // Target lang ang itinatakda dito; ang updateServo() ang gumagalaw nang dahan-dahan
+  targetServoAngle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+}
+
+void updateServo() {
+  unsigned long now = millis();
+  if (now - lastServoStepTime < SERVO_STEP_INTERVAL_MS) return;
+  lastServoStepTime = now;
+  if (currentServoAngle == targetServoAngle) return;
+
+  int diff = targetServoAngle - currentServoAngle;
+  if (abs(diff) <= SERVO_STEP_DEG) currentServoAngle = targetServoAngle;
+  else currentServoAngle += (diff > 0) ? SERVO_STEP_DEG : -SERVO_STEP_DEG;
+  liftServo.write(currentServoAngle);
 }
