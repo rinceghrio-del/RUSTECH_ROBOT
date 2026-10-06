@@ -65,6 +65,7 @@ uint8_t broadcastAddress[] = {0x20, 0x6E, 0xF1, 0x84, 0x66, 0xE8};
 #include <WiFi.h>
 #include "time.h"
 #include <WebServer.h> // Para sa FaceRobot Android app HTTP control (/command?dir=X)
+#include <Preferences.h> // V5.3.13: pang-save ng natutunang haba ng kanta (NVS)
 
 // ========================= OLED CONFIG & DECLARATION =========================
 
@@ -265,6 +266,133 @@ static unsigned long lastCheckTime = 0; //
 bool isAdvertPlaying = false; // Para malaman kung nagpe-play ng advert
 unsigned long advertStartTime = 0;
 unsigned long ADVERT_DURATION = 3000; // 3 seconds (Haba ng "Yes Boss" mo)
+
+// ---- ADVERT / MUSIC FIX (V5.3.10) ----
+// Sanhi ng auto-next: ang DFPlayer ay madalas magpadala ng DOBLENG "PlayFinished" pagkatapos ng advertise().
+// Yung una = advert done (na-handle), yung pangalawa = napagkamalang "tapos na ang kanta" -> shuffle next.
+// Dagdag pa: 3s lang ang timeout ng isAdvertPlaying, at may mga delay() sa loop kaya nahuhuli ang event.
+unsigned long advertGuardUntil = 0;      // hanggang kailan IGNORE ang lahat ng "finished" event
+unsigned long lastFinishedEventTime = 0; // para sa duplicate filter
+int lastFinishedValue = -1;
+bool resumePending = false;              // non-blocking resume pagkatapos ng advert
+int resumeStage = 0;                     // 1 = unang tingin, 2 = pangalawang tingin
+unsigned long resumeAt = 0;
+bool nextCheckPending = false;           // i-verify muna kung talagang tapos na ang kanta bago mag-next
+unsigned long nextCheckAt = 0;
+int nextCheckStage = 0;                  // 1 = unang tingin, 2 = pangalawang tingin (bago mag-next)
+int currentAdvertNum = -1;               // anong advert/greeting ang kasalukuyang tumutugtog
+
+unsigned long songStartTime = 0;   // kailan huling nag-play ng kanta (para malaman kung totoong tapos na)
+
+// Pumili ng random na kanta na HINDI kapareho ng kasalukuyan (iwas ulit-ulit)
+int pickRandomSong() {
+  if (totalMusicFiles <= 1) return 1;
+  int n;
+  do { n = random(1, totalMusicFiles + 1); } while (n == currentSongNumber);
+  return n;
+}
+
+// ---- SONG WATCHDOG (V5.3.12) ----
+// May mga MP3 na hindi nagpapadala ng "finished" event ang DFPlayer (naka-loop lang), kaya hindi nag-ne-next.
+// Solusyon: bilangin ang oras ng pagtugtog (hindi kasama habang may advert), at i-force next kapag lumampas.
+//  - DEFAULT_MAX_SONG_MS: limit para sa lahat ng kanta. 0 = PATAY (default) para hindi maputol ang mahahabang kanta (hal. 30 minuto)
+//  - songLimits[]: eksaktong haba (segundo) ng mga kantang problema, para eksakto ang next
+const unsigned long DEFAULT_MAX_SONG_MS = 0;   // 0 = walang default limit (songLimits[] at natutunang haba lang ang gagana)
+struct SongLimit { int track; unsigned int seconds; };
+const SongLimit songLimits[] = {
+  // {45, 140},     // HALIMBAWA: track 45 = 2:20 (140 segundo). Idagdag dito ang mga kantang umuulit.
+  {0, 0}            // dummy / dulo ng listahan - HUWAG BURAHIN
+};
+unsigned long songPlayedMs = 0;
+unsigned long lastSongTick = 0;
+
+// ---- ADVERT THROTTLE (V5.3.13) ----
+// Kapag naka-connect ang app, nagpapadala ito ng PLAY (advert) tuwing ~20-60s, at ang bawat advert ay nag-iinterrupt sa kanta.
+// Kung nire-restart ng DFPlayer mo ang kanta pagkatapos ng advert, hindi na ito aabot sa dulo (kaya parang "naka-loop").
+// ADVERT_MIN_GAP_MS = pinakamaikling pagitan ng dalawang advert HABANG MAY TUMUTUGTOG NA MUSIC. 0 = patay (lahat ng advert tutunog).
+// Halimbawa: 120000 = isang advert lang kada 2 minuto habang may music. (Walang music = laging tutunog.)
+const unsigned long ADVERT_MIN_GAP_MS = 0;
+unsigned long lastAdvertStartTime = 0;
+int advertsThisSong = 0;
+
+// ---- AUTO-LEARN NG HABA NG KANTA (V5.3.13) ----
+// Kapag natapos NANG NATURAL ang isang kanta (may finished event + state stopped), isinasave ang tunay na haba nito sa flash.
+// Sa susunod na tugtugin, kahit mag-loop ang DFPlayer (walang finished event), mag-ne-next ang robot sa EKSAKTONG dulo ng kanta.
+Preferences songPrefs;
+uint16_t learnedSec[256] = {0};
+bool songInterrupted = false;   // true kung naputol ang kanta ng dance/alert (hindi tama ang oras para i-learn)
+
+void loadSongDurations() {
+  songPrefs.begin("songdur", false);
+  for (int i = 1; i <= totalMusicFiles && i < 256; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "s%d", i);
+    learnedSec[i] = songPrefs.getUShort(key, 0);
+  }
+  Serial.println("[LEARN] Na-load ang mga natutunang haba ng kanta.");
+}
+
+void learnSongDuration(int track, unsigned long sec) {
+  if (track <= 0 || track >= 256) return;
+  if (sec < 20 || sec > 1200) return;                 // masyadong maikli/mahaba = hindi kapani-paniwala
+  uint16_t old = learnedSec[track];
+  if (old == 0 || sec + 2 < old) {                    // unang beses, o mas maikli (mas tumpak)
+    learnedSec[track] = (uint16_t)sec;
+    char key[8];
+    snprintf(key, sizeof(key), "s%d", track);
+    songPrefs.putUShort(key, (uint16_t)sec);
+    Serial.print("[LEARN] Track "); Serial.print(track);
+    Serial.print(" = "); Serial.print(sec); Serial.println("s (na-save)");
+  }
+}
+
+unsigned long songLimitMs(int track) {
+  for (int i = 0; songLimits[i].track != 0; i++) {
+    if (songLimits[i].track == track) return (unsigned long)songLimits[i].seconds * 1000UL + 4000UL; // +4s palugit
+  }
+  if (track > 0 && track < 256 && learnedSec[track] > 0) {
+    return (unsigned long)learnedSec[track] * 1000UL + 6000UL;   // natutunang haba + 6s palugit
+  }
+  return DEFAULT_MAX_SONG_MS;
+}
+
+// Palaging gamitin ito para mag-play ng kanta sa /MP3 folder
+void playSongTracked(int n) {
+  myDFPlayer.playMp3Folder(n);
+  songInterrupted = false;
+  songPlayedMs = 0;
+  lastSongTick = millis();
+  songStartTime = millis();
+  advertsThisSong = 0;
+}
+
+// Gamitin ito sa halip na direktang myDFPlayer.advertise()
+// - may music: i-pause ang kanta, tugtugin ang advert (ADVERT folder), tapos babalik sa parehong kanta
+// - walang music: normal play lang
+void playAdvertOverMusic(uint8_t advertNum) {
+  if (isMusicActive) {
+    if (ADVERT_MIN_GAP_MS > 0 && lastAdvertStartTime != 0 && (millis() - lastAdvertStartTime) < ADVERT_MIN_GAP_MS) {
+      Serial.print("[ADVERT] advertise("); Serial.print(advertNum);
+      Serial.println(") SKIPPED - masyadong madalas habang may music (ADVERT_MIN_GAP_MS)");
+      return;
+    }
+    lastAdvertStartTime = millis();
+    advertsThisSong++;
+    isAdvertPlaying = true;
+    advertStartTime = millis();
+    ADVERT_DURATION = 30000;   // safety net LANG (mahaba ang greeting tracks ng app; ang tunay na pag-clear ay galing sa "finished" event)
+    currentAdvertNum = advertNum;
+    advertGuardUntil = 0;
+    resumePending = false;
+    nextCheckPending = false;
+    Serial.print("[ADVERT] advertise("); Serial.print(advertNum);
+    Serial.print(") during song "); Serial.print(currentSongNumber);
+    Serial.print(" t="); Serial.println(millis());
+    myDFPlayer.advertise(advertNum);
+  } else {
+    myDFPlayer.play(advertNum);
+  }
+}
 
 // ---------------- NEW: Sleep Alert (IR wake reaction) ----------------
 
@@ -685,6 +813,7 @@ void handlePing() {
 
 void setup() {
   Serial.begin(115200);
+  loadSongDurations();
   delay(1000);
 
   WiFi.disconnect(true);
@@ -1054,7 +1183,7 @@ else if (dir == "MUSIC_ON") {
     myDFPlayer.play(3); // Play the first track to initialize
     delay(2000); // Wait for 2 seconds to ensure the player is ready
     currentSongNumber = random(1, totalMusicFiles + 1);
-    myDFPlayer.playMp3Folder(currentSongNumber);
+    playSongTracked(currentSongNumber);
     roboEyes.setMood(HAPPY);
 }
 else if (dir == "MUSIC_OFF") {
@@ -1069,7 +1198,7 @@ else if (dir == "MUSIC_NEXT") {
       if (currentSongNumber > totalMusicFiles) currentSongNumber = 1;
       myDFPlayer.play(3); // Play the first track to initialize
       delay(2000); // Wait for 2 seconds to ensure the player is ready
-      myDFPlayer.playMp3Folder(currentSongNumber);
+      playSongTracked(currentSongNumber);
       Serial.print("🎵 Next Track: ");
       Serial.println(currentSongNumber);
     }
@@ -1118,7 +1247,7 @@ else if (dir == "MUSIC_NEXT") {
   else if (dir == "GREET") {
     if (server.hasArg("track")) {
       int trackNum = server.arg("track").toInt();
-      myDFPlayer.play(trackNum);
+      playAdvertOverMusic(trackNum); // V5.3.10: may music = advertise (pause+resume), walang music = play
       Serial.print("🔊 Face-Track: GREETING TRACK ");
       Serial.println(trackNum);
     }
@@ -1127,7 +1256,7 @@ else if (dir == "MUSIC_NEXT") {
     int trackNum = 3;
     if (server.hasArg("track")) {
       int trackNum = server.arg("track").toInt();
-      myDFPlayer.play(trackNum);
+      playAdvertOverMusic(trackNum); // V5.3.10: may music = advertise (pause+resume), walang music = play
       Serial.print("🔊 Face-Track: PLAY TRACK ");
       Serial.println(trackNum);
     }
@@ -1154,7 +1283,7 @@ else if (dir == "MUSIC_NEXT") {
     currentState = STATE_DANCING;
     danceStartTime = millis();
     lastDanceStepTime = millis();
-    myDFPlayer.play(12);
+    songInterrupted = true; myDFPlayer.play(12);
     danceStep = 0;
     atrasAbanteCycleCount = 0;
     roboEyes.setMood(HAPPY);
@@ -1191,13 +1320,13 @@ else if (dir == "MUSIC_NEXT") {
   else if (dir == "LASER_ON") {
     digitalWrite(2, HIGH);
     Serial.println("🔦 Face-Track: LASER ON");
-    myDFPlayer.play(13);
+    playAdvertOverMusic(13);
     playBootSound_NB();
   } 
   else if (dir == "LASER_OFF") {
     digitalWrite(2, LOW);
     Serial.println("🔦 Face-Track: LASER OFF");
-    myDFPlayer.play(14);
+    playAdvertOverMusic(14);
     playSleepBeep_NB();
   }  
   else if (dir == "LIFT_UP") {
@@ -1235,35 +1364,59 @@ void loop() {
   server.handleClient(); // Palaging naka-listen sa FaceRobot app; ang aktwal na pag-galaw
                           // ay naka-gate sa loob ng handleCommand() (STATE_BOOT_WAIT lang)
 
-//=========== PINAGSAMANG MUSIC & ADVERT LOGIC =================
+//=========== PINAGSAMANG MUSIC & ADVERT LOGIC (V5.3.10 FIX) =================
 if (myDFPlayer.available()) {
     uint8_t type = myDFPlayer.readType();
     int value = myDFPlayer.read(); 
 
+    Serial.print("[DF] type="); Serial.print(type);
+    Serial.print(" value="); Serial.print(value);
+    Serial.print(" t="); Serial.print(millis());
+    Serial.print(" advertFlag="); Serial.print(isAdvertPlaying);
+    Serial.print(" robot="); Serial.print(stateName(currentState));
+    Serial.print(" song="); Serial.println(currentSongNumber);
+
     if (type == DFPlayerPlayFinished) {
-        // 1. Check kung boses (Wake Word) ang natapos
-        // Track 2 o Track 1 (depende sa setup mo)
-        if (value == 2 || value == 1 || isAdvertPlaying) { 
-            isAdvertPlaying = false; 
-            Serial.println("Voice response done. Resuming music...");
+        unsigned long t = millis();
+
+        // 1. DUPLICATE FILTER: madalas dalawang beses ipadala ng DFPlayer ang parehong "finished"
+        bool duplicate = (value == lastFinishedValue && (t - lastFinishedEventTime) < 1500);
+        lastFinishedValue = value;
+        lastFinishedEventTime = t;
+
+        if (duplicate) {
+            Serial.print("Duplicate finished event ignored: ");
+            Serial.println(value);
+        }
+        // 2. Advert ang natapos -> resume lang, HUWAG mag-next
+        else if (isAdvertPlaying) {
+            isAdvertPlaying = false;
+            advertGuardUntil = t + 1500;   // ignore ang anumang extra event pagkatapos nito
+            Serial.println("Advert done. Resuming music (no next)...");
             if (isMusicActive) {
-                delay(200);
-                myDFPlayer.start();
+                resumePending = true;
+                resumeStage = 1;
+                resumeAt = t + 600;   // bigyan ng oras ang DFPlayer na mag-auto-resume
             }
-        } 
-        // 2. Music Mode is ON - MAG-NEXT NA KAHIT ANONG TRACK ID PA YAN
+        }
+        // 3. Nasa guard window pa (kakatapos lang ng advert / kakalipat ng track) -> ignore
+        else if ((long)(advertGuardUntil - t) > 0) {
+            Serial.print("Finished event ignored (guard window): ");
+            Serial.println(value);
+        }
+        // 4. Tunay na natapos ang kanta -> shuffle next
         else if (isMusicActive) {
-            // Basta hindi boses ang natapos, ibig sabihin kanta na yun!
-            Serial.print("Track ");
+            // HUWAG agad mag-next: itanong muna sa DFPlayer kung tumutugtog pa (tingnan sa baba)
+            nextCheckPending = true;
+            nextCheckStage = 1;
+            nextCheckAt = t + 700;
+            Serial.print("Finished event for track ");
             Serial.print(value);
-            Serial.println(" finished. Shuffling next...");
-            
-            currentSongNumber = random(1, totalMusicFiles + 1);
-            delay(300);
-            myDFPlayer.playMp3Folder(currentSongNumber);
-            
-            Serial.print("Now Playing: ");
-            Serial.println(currentSongNumber);
+            Serial.print(" (kanta nag-play ng ");
+            Serial.print(songPlayedMs / 1000);
+            Serial.print("s, adverts sa kantang ito: ");
+            Serial.print(advertsThisSong);
+            Serial.println(") -> verifying DFPlayer state...");
         }
         else {
             Serial.print("Sound ");
@@ -1273,16 +1426,109 @@ if (myDFPlayer.available()) {
     }
 }
 
-// Logic para sa Timer (Optional safety net)
-// Kung hindi nag-send ng "Finished" signal ang DFPlayer, 
-// gagamitin natin ang timer mo bilang backup.
-if (isAdvertPlaying) {
-    if (millis() - advertStartTime > ADVERT_DURATION) {
-        isAdvertPlaying = false;
-        //Serial.println("Advert timeout. Ready for next command.");
-        // Note: Huwag mag-myDFPlayer.start() dito para hindi mag-clash 
-        // sa DFPlayerPlayFinished signal.
+// Non-blocking resume - STATE-AWARE (V5.3.14)
+// Natuklasan: kapag nag-advert NG MALAPIT NA MATAPOS ang kanta, "stopped" na ang DFPlayer pagkatapos ng advert.
+// Ang dating start() ay nagre-restart ng kasalukuyang kanta mula sa umpisa = "inuulit ang kanta".
+// Ngayon: playing = ayos na | paused = start() | stopped = tapos na ang kanta -> NEXT (hindi start()).
+if (resumePending && (long)(millis() - resumeAt) >= 0) {
+    if (!isMusicActive || isAdvertPlaying) {
+        resumePending = false;   // na-stop ang music o may bagong advert
+    } else {
+        int stRaw = myDFPlayer.readState();                 // 512 stopped, 513 playing, 514 paused
+        int st = (stRaw < 0) ? stRaw : (stRaw & 0xFF);
+        Serial.print("[RESUME] check "); Serial.print(resumeStage);
+        Serial.print(" raw="); Serial.print(stRaw);
+        Serial.print(" -> "); Serial.println(st);
+        if (st == 1) {
+            resumePending = false;
+            Serial.println("[RESUME] Tumutugtog na ang kanta (auto-resume ng DFPlayer) -> WALANG start().");
+        }
+        else if (st == 2) {
+            resumePending = false;
+            Serial.println("[RESUME] Naka-pause -> start().");
+            myDFPlayer.start();
+        }
+        else if (resumeStage == 1) {
+            resumeStage = 2;
+            resumeAt = millis() + 800;   // baka nasa gitna pa ng resume, tingnan ulit
+        }
+        else {
+            resumePending = false;
+            // STOPPED pagkatapos ng advert = natapos na ang kanta habang may advert -> next, HUWAG i-restart
+            currentSongNumber = pickRandomSong();
+            playSongTracked(currentSongNumber);
+            advertGuardUntil = millis() + 1000;
+            Serial.print("[RESUME] Tapos na pala ang kanta -> NEXT. Now Playing: ");
+            Serial.println(currentSongNumber);
+        }
     }
+}
+
+// SONG WATCHDOG: kapag lumampas na sa haba ng kanta pero walang "finished" event -> FORCE NEXT
+{
+    unsigned long tickNow = millis();
+    unsigned long dt = tickNow - lastSongTick;
+    lastSongTick = tickNow;
+    if (isMusicActive && !isAdvertPlaying && !nextCheckPending) {
+        songPlayedMs += dt;   // hindi binibilang habang may advert (naka-pause ang kanta)
+        unsigned long songLimit = songLimitMs(currentSongNumber);
+        if (songLimit > 0 && songPlayedMs > songLimit) {
+            Serial.print("[WATCHDOG] Track ");
+            Serial.print(currentSongNumber);
+            Serial.print(" lumampas na (");
+            Serial.print(songPlayedMs / 1000);
+            Serial.println("s) walang finished event -> FORCE NEXT.");
+            currentSongNumber = pickRandomSong();
+            playSongTracked(currentSongNumber);
+            advertGuardUntil = millis() + 1000;
+            Serial.print("Now Playing: ");
+            Serial.println(currentSongNumber);
+        }
+    }
+}
+
+// VERIFY: totoo bang tapos na ang kanta? (2 beses titingnan bago mag-next)
+if (nextCheckPending && (long)(millis() - nextCheckAt) >= 0) {
+    if (!isMusicActive || isAdvertPlaying) {
+        nextCheckPending = false;   // may advert na pumasok / na-stop na ang music
+    } else {
+        // SD card: 512 = stopped, 513 = playing, 514 = paused (nasa low byte ang tunay na state)
+        int stRaw = myDFPlayer.readState();
+        int st = (stRaw < 0) ? stRaw : (stRaw & 0xFF);   // 0 = stopped, 1 = playing, 2 = paused
+        Serial.print("DFPlayer state (check "); Serial.print(nextCheckStage);
+        Serial.print(") raw="); Serial.print(stRaw);
+        Serial.print(" -> "); Serial.println(st);
+        if (st == 1) {
+            nextCheckPending = false;
+            Serial.println("Tumutugtog pa -> false finished event, HINDI mag-next.");
+        }
+        else if (st == 2) {
+            nextCheckPending = false;
+            Serial.println("Naka-pause pala -> resume lang, HINDI mag-next.");
+            myDFPlayer.start();
+        }
+        else if (nextCheckStage == 1) {
+            // baka nasa gitna pa ng resume -> bigyan ng pangalawang pagkakataon
+            nextCheckStage = 2;
+            nextCheckAt = millis() + 800;
+        }
+        else {
+            nextCheckPending = false;
+            if (!songInterrupted) learnSongDuration(currentSongNumber, songPlayedMs / 1000);
+            currentSongNumber = pickRandomSong();
+            playSongTracked(currentSongNumber);
+            advertGuardUntil = millis() + 1000;
+            Serial.print("Tapos na talaga. Now Playing: ");
+            Serial.println(currentSongNumber);
+        }
+    }
+}
+
+// Safety net: kung hindi dumating ang "finished" ng advert, i-clear din ang flag
+// (ang guard window ang sasalo sa late/duplicate events)
+if (isAdvertPlaying && (millis() - advertStartTime > ADVERT_DURATION)) {
+    isAdvertPlaying = false;
+    advertGuardUntil = millis() + 1500;
 }
 
   // --- BUTTON DEBOUNCING LOGIC ---
@@ -1498,15 +1744,7 @@ if (millis() - lastCheck > 300) {
      if (cmdID == 1) {
     Serial.println("Robot: Wake Word Detected!");
 
-    if (isMusicActive) {
-        isAdvertPlaying = true;
-        advertStartTime = millis();
-        ADVERT_DURATION = 3000; 
-        myDFPlayer.advertise(3); 
-    } 
-    else {
-        myDFPlayer.play(3); 
-    }
+    playAdvertOverMusic(3);
 
     // --- Animations ---
     stopBot();
@@ -1523,15 +1761,7 @@ if (millis() - lastCheck > 300) {
  if (cmdID == 2) {
     Serial.println("Robot: Wake Word Detected!");
 
-    if (isMusicActive) {
-        isAdvertPlaying = true;
-        advertStartTime = millis();
-        ADVERT_DURATION = 3000; 
-        myDFPlayer.advertise(2); 
-    } 
-    else {
-        myDFPlayer.play(2); 
-    }
+    playAdvertOverMusic(2);
 
     // --- Animations ---
     stopBot();
@@ -1551,7 +1781,7 @@ if (millis() - lastCheck > 300) {
     unsigned long now = millis();
     danceStartTime = now;          
     lastDanceStepTime = now;
-    myDFPlayer.play(12);       
+    songInterrupted = true; myDFPlayer.play(12);       
     atrasAbanteCycleCount = 0;   
     danceStep = 0;               
     
@@ -1566,7 +1796,7 @@ if (millis() - lastCheck > 300) {
 
     // 3. MOVE FORWARD (ID 22)
     else if (cmdID == 130) {
-      myDFPlayer.play(7);
+      playAdvertOverMusic(7);
       Serial.println("Robot: Moving Forward...");
       roboEyes.setMood(HAPPY);
       forward();
@@ -1630,7 +1860,7 @@ if (millis() - lastCheck > 300) {
 
    // 8. DISPLAY NUMBER 1 (ID 53)
     else if (cmdID == 53) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 1");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1648,7 +1878,7 @@ if (millis() - lastCheck > 300) {
 
     // 9. DISPLAY NUMBER 2 (ID 54)
     else if (cmdID == 54) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 2");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1666,7 +1896,7 @@ if (millis() - lastCheck > 300) {
 
     // 10. DISPLAY NUMBER 3 (ID 55)
     else if (cmdID == 55) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 3");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1684,7 +1914,7 @@ if (millis() - lastCheck > 300) {
 
     // 11. DISPLAY NUMBER 4 (ID 56)
     else if (cmdID == 56) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 4");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1702,7 +1932,7 @@ if (millis() - lastCheck > 300) {
 
     // 12. DISPLAY NUMBER 5 (ID 57)
     else if (cmdID == 57) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 5");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1720,7 +1950,7 @@ if (millis() - lastCheck > 300) {
    
     // 13. DISPLAY NUMBER 6 (ID 58)
     else if (cmdID == 58) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 6");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1738,7 +1968,7 @@ if (millis() - lastCheck > 300) {
 
     // 14. DISPLAY NUMBER 7 (ID 59)
     else if (cmdID == 59) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 7");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1756,7 +1986,7 @@ if (millis() - lastCheck > 300) {
 
     // 15. DISPLAY NUMBER 8 (ID 60)
     else if (cmdID == 60) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 8");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1774,7 +2004,7 @@ if (millis() - lastCheck > 300) {
 
     // 16. DISPLAY NUMBER 9 (ID 61)
     else if (cmdID == 61) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 9");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1792,7 +2022,7 @@ if (millis() - lastCheck > 300) {
 
     // 17. DISPLAY NUMBER 0 (ID 52)
     else if (cmdID == 52) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("🔢 Command: Display Number 0");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1810,7 +2040,7 @@ if (millis() - lastCheck > 300) {
 
     // 18. DISPLAY PERFECT HEART (ID 64)
     else if (cmdID == 64) {
-      myDFPlayer.play(3); 
+      playAdvertOverMusic(3); 
       Serial.println("❤️ Command: Display Perfect Heart");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1835,7 +2065,7 @@ if (millis() - lastCheck > 300) {
 
     // 19. DISPLAY TIME (ID 8)
     else if (cmdID == 8) {
-      myDFPlayer.play(4); 
+      playAdvertOverMusic(4); 
       Serial.println("⏰ Command: Display Time");
       stopBot(); 
       playBootSound_NB(); // Beep feedback
@@ -1850,7 +2080,7 @@ if (millis() - lastCheck > 300) {
     
     // 20. MOVE FORWARD (ID 22)
     else if (cmdID == 22) {
-      myDFPlayer.play(5); 
+      playAdvertOverMusic(5); 
       Serial.println("🤖 Command: MOVE FORWARD");
       bool leftPit = digitalRead(IR_SENSOR_LEFT);
       bool rightPit = digitalRead(IR_SENSOR_RIGHT); 
@@ -1868,7 +2098,7 @@ if (millis() - lastCheck > 300) {
 
     // 21. MOVE BACKWARD (ID 23)
     else if (cmdID == 23) {
-      myDFPlayer.play(6); 
+      playAdvertOverMusic(6); 
       Serial.println("🤖 Command: MOVE BACKWARD");
       roboEyes.setMood(ANGRY);
       reverse();
@@ -1886,7 +2116,8 @@ if (millis() - lastCheck > 300) {
     // Kukuha ng random number mula 1 hanggang sa total ng files mo
     currentSongNumber = random(1, totalMusicFiles + 1); 
     
-    myDFPlayer.playMp3Folder(currentSongNumber);
+    playSongTracked(currentSongNumber);
+    isAdvertPlaying = false; resumePending = false; nextCheckPending = false;
     
     Serial.print("Shuffled Start! Playing Track: ");
     Serial.println(currentSongNumber);
@@ -1900,6 +2131,7 @@ if (millis() - lastCheck > 300) {
     // 1. Opsyonal: Voice feedback para alam mong narinig ka
     // "Ok, next song!" (Siguraduhing may 0002.mp3 sa ADVERT folder)
     myDFPlayer.advertise(3);
+    advertGuardUntil = millis() + 3000; // ignore stray "finished" events habang lumilipat
     delay(500); // Konting pahinga para matapos ang sound
 
     // 2. Logic para sa paglipat ng kanta
@@ -1911,7 +2143,8 @@ if (millis() - lastCheck > 300) {
     }
 
     // 4. I-play na ang susunod na track sa /mp3 folder
-    myDFPlayer.playMp3Folder(currentSongNumber);
+    playSongTracked(currentSongNumber);
+    isAdvertPlaying = false; resumePending = false; nextCheckPending = false; // naputol na ang advert, i-clear ang flag
     
     // 5. I-update ang timer (kung ginagamit mo pa yung timer logic)
     // lastCheckTime = millis(); 
@@ -1929,6 +2162,7 @@ if (millis() - lastCheck > 300) {
 
     // 1. Opsyonal: Voice feedback (Kung may "Previous" sound ka sa ADVERT folder)
     myDFPlayer.advertise(3); 
+    advertGuardUntil = millis() + 3000; // ignore stray "finished" events habang lumilipat
     delay(500);
 
     // 2. Logic para sa pagbabawas ng kanta
@@ -1940,7 +2174,8 @@ if (millis() - lastCheck > 300) {
     }
 
     // 4. I-play ang kanta mula sa /mp3 folder
-    myDFPlayer.playMp3Folder(currentSongNumber);
+    playSongTracked(currentSongNumber);
+    isAdvertPlaying = false; resumePending = false; nextCheckPending = false; // naputol na ang advert, i-clear ang flag
 
     Serial.print("Bumalik sa Track #: ");
     Serial.println(currentSongNumber);
@@ -1952,7 +2187,7 @@ if (millis() - lastCheck > 300) {
   // 25. TURN LEFT 90 DEGREES (ID 25) ---
 if (cmdID == 25) {
     Serial.println("Command: Turn Left 90 Degrees");
-    myDFPlayer.play(3);
+    playAdvertOverMusic(3);
     turnLeft(); // Tatawagin nito yung function na nilaga
     delay(800); // Adjust ang delay depende sa bilis ng motor mo
     cmdID = 0;    // Reset para hindi paulit-ulit ang ikot
@@ -1961,7 +2196,7 @@ if (cmdID == 25) {
   // 26. TURN RIGHT 90 DEGREES (ID 28) ---
 if (cmdID == 28) {
     Serial.println("Command: Turn Right 90 Degrees");
-    myDFPlayer.play(3);
+    playAdvertOverMusic(3);
     turnRight(); // Tatawagin nito yung function na nilagay natin sa 
     delay(800); // Adjust ang delay depende sa bilis ng motor mo
     cmdID = 0;
@@ -1971,14 +2206,14 @@ if (cmdID == 28) {
 if (cmdID == 9) {
   digitalWrite(2, HIGH); // Bukas ang Laser
   Serial.println("VFL ON");
-  myDFPlayer.play(13);
+  playAdvertOverMusic(13);
   playBootSound_NB();
   cmdID = 0;
 }
   else if (cmdID == 10) { // O kung anong OFF command mo
   digitalWrite(2, LOW);  // Patay ang Laser
   Serial.println("VFL OFF");
-  myDFPlayer.play(14);
+  playAdvertOverMusic(14);
   playSleepBeep_NB();
   cmdID = 0;
 }
@@ -2126,7 +2361,7 @@ case STATE_BOOT_WAIT: {
   if (pirDetected) {
     if (millis() - lastPIRTriggerTime > 900000) {
       Serial.println("ULTRASONIC: Presence detected!");
-      myDFPlayer.play(11);
+      playAdvertOverMusic(11); // may music = pause + advert (ADVERT/0011.mp3) + resume; walang music = play(11) sa root
       lastPIRTriggerTime = millis();
       roboEyes.setMood(HAPPY);
       roboEyes.anim_laugh();
@@ -2733,7 +2968,7 @@ void handleSecurityGuard() {
     
     // 2. Mag-react (Palitan ang eyes at tumunog)
     roboEyes.setMood(ANGRY); // Kunwari striktong guard
-    myDFPlayer.playMp3Folder(11); // Halimbawa: Track 12 ay "Sino yan?!"
+    songInterrupted = true; myDFPlayer.playMp3Folder(11); // Halimbawa: Track 12 ay "Sino yan?!"
     
     // 3. Animation (Look around)
     roboEyes.anim_confused();
@@ -2782,7 +3017,7 @@ void showRustechOPM() {
 
   // Preno: Titunog lang kung may pagbabago sa signal
   if (kasalukuyangStatus != 0 && kasalukuyangStatus != hulingTugtog) {
-    myDFPlayer.play(kasalukuyangStatus);
+    playAdvertOverMusic(kasalukuyangStatus);
     hulingTugtog = kasalukuyangStatus; // Tandaan ang huling tinugtog
     Serial.print("Voice Play: "); Serial.println(kasalukuyangStatus);
   }
@@ -2838,7 +3073,7 @@ void handle_bluetooth_data() {
       currentState = STATE_DANCING; // Gamit ang STATE_DANCING constant mo
       danceStartTime = millis();
       lastDanceStepTime = millis();
-      myDFPlayer.play(12); // Pinapatugtog ang track 12 para sa sayaw
+      songInterrupted = true; myDFPlayer.play(12); // Pinapatugtog ang track 12 para sa sayaw
       danceStep = 0;
       atrasAbanteCycleCount = 0;
       roboEyes.setMood(HAPPY);
@@ -2854,7 +3089,7 @@ void handle_bluetooth_data() {
       
       // I-play ang unang kanta o i-trigger ang shuffle start
       currentSongNumber = random(1, totalMusicFiles + 1);    
-      myDFPlayer.playMp3Folder(currentSongNumber);
+      playSongTracked(currentSongNumber);
       
       // Visual feedback sa OLED
       roboEyes.setMood(HAPPY);
