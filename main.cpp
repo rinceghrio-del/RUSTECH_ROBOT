@@ -1,5 +1,5 @@
 // IP: 192.168.1.4 | MAC: c8f74240bcb4=======================================================================================
-// ROBOT SKETCH: ULTIMATE VERSION V5.3.9
+// ROBOT SKETCH: ULTIMATE VERSION V5.3.14
 // W/ PERMANENT IR SLEEP, NON-BLOCKING AVOIDANCE, NTP TIME, & 1-MINUTE ALARM CLOCK
 // Modified: Add SLEEP IR Wake Reaction (STATE_SLEEP_ALERT) - Rustech patch
 // MODIFIED: Merged conflicting STATE_SLEEP with STATE_SLEEPING_IR, Fixed IR Logic.
