@@ -1,5 +1,5 @@
 // IP: 192.168.1.4 | MAC: c8f74240bcb4=======================================================================================
-// ROBOT SKETCH: ULTIMATE VERSION V5.3.14
+// ROBOT SKETCH: ULTIMATE VERSION V5.3.9
 // W/ PERMANENT IR SLEEP, NON-BLOCKING AVOIDANCE, NTP TIME, & 1-MINUTE ALARM CLOCK
 // Modified: Add SLEEP IR Wake Reaction (STATE_SLEEP_ALERT) - Rustech patch
 // MODIFIED: Merged conflicting STATE_SLEEP with STATE_SLEEPING_IR, Fixed IR Logic.
@@ -7,6 +7,49 @@
 // Modified: Added Music Player Functionality w/ DFRo
 // bot DFPlayer Mini & DF2301Q Voice Module
 // MERGED: Added FaceRobot Android app HTTP control (/command?dir=X), active ONLY in STATE_BOOT_WAIT
+// V5.5.2: ALARM: DFPlayer at BUZZER ay SABAY na. track 1..254 = boses ng robot na tutugtog ISANG BESES (kasabay ng buzzer);
+//         track 255 = MUSIKA (shuffle sa /MP3). PERMANENTE (V5.5.3): palaging kasabay ng buzzer ang DFPlayer track.
+//         Pareho pa rin ang laki ng AlarmSlot (24 bytes) - hindi mawawala ang naka-save na alarm. Pangalan ng alarm: hanggang 15 characters.
+// V5.5.1: FIX boot-loop: ang esp_now_peer_info_t sa setup() ay hindi naka-zero (random ang ifidx -> "Peer interface is invalid"),
+//         tapos nag-return ang setup() nang maaga kaya nag-crash ang loop() (LoadProhibited). Naka-zero na at hindi na nag-return.
+// V5.5.0: ALARM CLOCK na ise-set ng FaceRobot app (boses o screen) - ang ESP32 pa rin ang nagti-trigger:
+//         - Hanggang 8 alarm, SINESAVE sa NVS (hindi nawawala kapag nag-restart). Unang boot: ang dating 6:00 AM araw-araw.
+//         - Bawat alarm: oras, araw (bitmask bit0=Linggo..bit6=Sabado, 0 = kahit anong araw), once (isang beses lang),
+//           optional DFPlayer track (0 = buzzer lang), label. Tumutunog kahit patay ang app/phone.
+//         - Mga command (tinatanggap sa ANUMANG state): /command?dir=ALARM_SET&h=19&m=0[&days=62][&once=1][&track=N][&label=X][&id=K]
+//           ALARM_DEL&id=K|ALL, ALARM_ENABLE&id=K&on=0|1, ALARM_LIST, ALARM_STOP, ALARM_SNOOZE&min=5,
+//           SETTIME&epoch=<unix seconds UTC>[&force=1] (para sa walang NTP; hindi ino-overwrite ang NTP maliban kung force).
+//         - Lahat ng ALARM_* ay sumasagot ng JSON: {"valid","now","ringing","snooze","set","alarms":[...]}.
+//         - FORCE_STOP ("hinto") ay pinapatay na rin ang tumutunog na alarm. /ping ay may dagdag na "|ALARM=1" habang tumutunog at "|TV=0/1" (may tamang oras na ba).
+//         - Hindi na hinihintay ang WiFi para tumunog (basta may tamang oras na ang ESP32).
+// V5.4.4: SHAKE command: /command?dir=SHAKE&ms=N - maikling alog (shake) na N milliseconds (default 100, 40..1500),
+//         mabilis ang paiwas-liko (25ms bawat hakbang) para magmukhang "alog" kahit ~100ms lang. Para sa reaksyon ng
+//         robot sa laro (hal. kapag nakakain ang robot sa chess). Gumagana lang sa STATE_BOOT_WAIT at hindi sa
+//         gilid ng bangin (pit). Ang dating SHAKING command ay hindi nagbago.
+// V5.4.3: WAKE command: /command?dir=WAKE gigising sa ESP32 mula sa sleep (STATE_SLEEPING_IR / SLEEP_ALERT /
+//         SLEEP_ULTRASONIC_OSC - kasama ang "stuck" sleep dahil sa maraming pit trigger) PABALIK SA STATE_BOOT_WAIT
+//         (hindi MOVING), tahimik (walang boot sound/advert para hindi magsabay sa boses ng app). Ang app ang
+//         nagpapadala nito kapag narinig ang wake word habang tulog. Ang app naman ay natutulog kasabay ng ESP32
+//         (nababasa nito ang "SLEEPING_IR" sa /ping). Walang epekto ang WAKE kapag hindi tulog ang ESP32.
+// V5.4.2: APP SLEEP MODE: kapag natutulog ang FaceRobot app (sleep mode), naka-OFF ang lahat ng galaw na galing sa
+//         ULTRASONIC sa STATE_BOOT_WAIT: ang distance-keeper (abante/atras/hinto), ang "too close" na atras, at ang
+//         presence trigger (advert + shake). Commands: /command?dir=SLEEP_ON (ulit-ulitin ng app kada ~2s - heartbeat)
+//         at dir=SLEEP_OFF. Kapag tumigil ang heartbeat ng APP_SLEEP_HOLD_MS (nag-crash/nawala ang WiFi), kusa itong
+//         mag-e-expire para bumalik ang proteksyon. Ang PIT sensors (bangin) ay NANANATILING GUMAGANA para sa kaligtasan.
+// V5.4.1: PIT BACK-OFF (STATE_BOOT_WAIT / face-tracking): dati, umaatras lang habang HIGH pa ang pit sensor,
+//         kaya humihinto mismo sa gilid at nagti-trigger ulit pagsulong. Ngayon, tuloy ang pag-atras ng
+//         PIT_BACKOFF_EXTRA_MS PAGKATAPOS mawala ang pit, at hindi susulong ang face-tracking (FORWARD) sa loob ng
+//         PIT_FORWARD_LOCK_MS pagkatapos (pwede pa ring lumiko/umatras) - para lumayo at hindi na mag-paulit-ulit.
+// V5.4.0: PIT SENSOR REPORT + SAY/SERVO (para sa FaceRobot app):
+//         - /ping ay sumasagot na ng "PONG|<STATE>|PIT=<L|R|LR|0>" (hal. "PONG|MOVING|PIT=L") - galing sa
+//           IR_SENSOR_LEFT (19) / IR_SENSOR_RIGHT (16), Active-HIGH. May "latch" na PIT_LATCH_MS para hindi
+//           ma-miss ng app (nagpo-poll kada ~400ms) ang mabilis na trigger. Ang app ang magpapakita ng gulat
+//           na mata at magsasalita/magpa-play ng track 75.
+//         - Bagong commands na tinatanggap sa ANUMANG state (hindi naka-gate sa STATE_BOOT_WAIT):
+//             /command?dir=SAY&track=N     -> itugtog ang DFPlayer track (advert kung may music)
+//             /command?dir=SERVO&servo=A   -> servo (camera tilt) LANG; walang galaw ng motor
+//           Para gumana ang pit reaction kahit MOVING/AVOIDING ang robot (dati IGNORED ang STOP/PLAY doon).
+//         - Ang pag-iwas sa pit (preno/atras) ay firmware pa rin ang may hawak, gaya ng dati.
 // V5.3.9: CAMERA OBSTACLE AVOIDANCE (depth model sa FaceRobot app) habang STATE_MOVING:
 //         - /ping ay sumasagot na ng "PONG|<STATE>" para malaman ng app kung naka-MOVING ang robot.
 //         - Bagong commands (tinatanggap lang habang MOVING / AVOIDING): NAV_LEFT, NAV_RIGHT, NAV_BACK, NAV_CLEAR
@@ -47,7 +90,7 @@ unsigned long lastTelemetryTime = 0;
 Servo liftServo;
 #define SERVO_PIN 15
 #define SERVO_MIN_ANGLE 0
-#define SERVO_MAX_ANGLE 110   // physical limit - lagpas dito, babangga sa floor
+#define SERVO_MAX_ANGLE 160   // physical limit - lagpas dito, babangga sa floor
 int currentServoAngle = 0;    // simulan sa pinakababa (folded/down position)
 int targetServoAngle = 0;     // ang gustong marating ng servo
 unsigned long lastServoStepTime = 0;
@@ -85,8 +128,8 @@ int hulingTugtog = 0; // 0 = wala pa, 15 = LOS, 16 = Good, 17 = Warning
 
 // >>>>>>>>>>>>>>>>>> NTP & WIFI CONFIG (PALITAN ITO) <<<<<<<<<<<<<<<<<<
 
-const char* ssid = "Rusty";
-const char* password = "12345678";
+const char* ssid = "Rail Gridon";
+const char* password = "Rustygrace31@@";
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 28800; // GMT+8 for Philippines
 const int   daylightOffset_sec = 0;
@@ -101,21 +144,39 @@ const int   daylightOffset_sec = 0;
 WebServer server(80);
 unsigned long lastFaceCommandTime = 0;
 const unsigned long FACE_COMMAND_TIMEOUT = 600; // ms - kung wala nang bagong command dito, babalik sa autonomous mode
-const int FACE_TURN_SPEED = 130;     // mas mabagal na turn - dating 220 masyadong bilis, kaya nagwawild
+const int FACE_TURN_SPEED = 150;     // mas mabagal na turn - dating 220 masyadong bilis, kaya nagwawild
 const int FACE_FORWARD_SPEED = 140;  // mas mabagal ding forward/backward para sa follow
 bool appLinked = false;                 // true = may nakausap nang app -> IP-only ang OLED
 unsigned long lastAppContactTime = 0;
 unsigned long lastIpDrawTime = 0;
 bool ipScreenNeedsDraw = true;
 const unsigned long IP_REDRAW_INTERVAL = 2000;
-const unsigned long APP_LINK_TIMEOUT_MS = 10000; // 10s walang ping/command mula sa app = disconnected -> balik sa roboEyes (0 = laging IP-only)
+const unsigned long APP_LINK_TIMEOUT_MS = 5000; // 5s walang ping/command mula sa app = disconnected -> balik sa roboEyes (0 = laging IP-only)
 // ========================= ALARM CONFIGURATION =========================
 
-const int ALARM_HOUR = 06;
-const int ALARM_MINUTE = 00;
-const bool isAlarmSet = true;
+// V5.5.0: dating nakapirming 6:00 AM lang. Ngayon hanggang MAX_ALARMS na ise-set ng app (tingnan ang handleAlarmCommand).
+#define MAX_ALARMS 8
+struct AlarmSlot {
+  uint8_t used;     // 0/1
+  uint8_t enabled;  // 0/1
+  uint8_t hour;     // 0-23
+  uint8_t minute;   // 0-59
+  uint8_t days;     // bitmask: bit0=Linggo ... bit6=Sabado; 0 = kahit anong araw
+  uint8_t once;     // 1 = isang beses lang (mag-o-off pagkatapos tumunog)
+  uint8_t track;    // 0 = buzzer lang | 1..254 = DFPlayer clip (ISANG BESES, kasabay ng buzzer) | 255 = MUSIC (shuffle sa /MP3) kasabay ng buzzer
+  char label[16];
+  uint8_t flags;    // RESERVED (hindi ginagamit; palaging kasabay ang buzzer). Nasa dulo para tugma sa dating naka-save
+};
+static_assert(sizeof(AlarmSlot) == 24, "AlarmSlot dapat 24 bytes para hindi mawala ang naka-save na alarm");
+AlarmSlot alarms[MAX_ALARMS];
+uint8_t alarmTrackNum = 0;            // track ng tumutunog (o huling tumunog, para sa snooze)
+bool alarmBuzzerMuted = false;
+unsigned long alarmAudioStartMs = 0;  // millis() nang magsimula ang DFPlayer ng alarm
+long alarmLastFiredMin[MAX_ALARMS];   // epoch/60 ng huling tunog (iwas dobleng tunog sa iisang minuto)
+Preferences alarmPrefs;
+time_t snoozeUntil = 0;               // >0 = may naka-snooze (epoch seconds)
 bool isAlarmTriggeredToday = false;
-unsigned long alarmTriggerTime = 0;
+unsigned long alarmTriggerTime = 0;   // >0 = tumutunog ngayon (millis() ng simula)
 const unsigned long ALARM_DURATION = 120000; // 2 mimutes
 const int ALARM_TONE_FREQ = 1000;
 unsigned long pirDisableUntil = 0;
@@ -130,6 +191,24 @@ bool isDisplayingNumber = false; // Bagong flag para sa numero
 
 #define IR_SENSOR_LEFT 19    // Pit Detection (Active-HIGH)
 #define IR_SENSOR_RIGHT 16   // Pit Detection (Active-HIGH)
+
+// V5.4.0: Pit report para sa FaceRobot app (tignan ang updatePit()/pitCode() sa tabi ng handlePing)
+#define IR_PIT_ACTIVE_LEVEL HIGH      // Active-HIGH ang pit sensors mo (HIGH = walang sahig)
+#define PIT_LATCH_MS 1500             // gaano katagal "nakadikit" ang PIT flag sa /ping pagkatapos ma-trigger
+unsigned long pitLatchUntil = 0;
+bool pitLatchedLeft = false;
+bool pitLatchedRight = false;
+
+// V5.4.1: Pit back-off sa face-tracking mode (STATE_BOOT_WAIT)
+#define PIT_BACKOFF_EXTRA_MS 500      // ITAAS para mas malayo ang aatrasan (dagdag NA atras pagkatapos mawala ang pit)
+#define PIT_FORWARD_LOCK_MS  4000     // hindi susulong ang face-tracking sa ganitong tagal pagkatapos umatras
+unsigned long pitBackoffUntil = 0;
+unsigned long pitForwardLockUntil = 0;
+
+// V5.4.2: Sleep mode ng app (heartbeat-based)
+#define APP_SLEEP_HOLD_MS 15000       // mag-e-expire kung walang SLEEP_ON heartbeat sa loob ng ganito katagal
+unsigned long appSleepUntil = 0;
+bool appSleeping() { return (long)(appSleepUntil - millis()) > 0; }
 
 unsigned long pauseDuration = 800; // Hinto ng 0.8 seconds bago lumingon
 
@@ -190,6 +269,7 @@ enum RobotState {
 };
 
 int shakeDuration = 3000; // Default ay 3 seconds
+int shakeStepMs = 150;    // V5.4.4: gaano katagal ang bawat kaliwa/kanan na hakbang ng shake (150 = dati; 25 = mabilis na alog)
 
 RobotState currentState = STATE_MOVING;
 enum EdgeDetected { EDGE_NONE = 0, EDGE_LEFT = 1, EDGE_RIGHT = 2, EDGE_BOTH = 3 };
@@ -197,18 +277,18 @@ EdgeDetected lastEdgeDetected = EDGE_NONE;
 //const int BASE_SPEED = 120;
 //const int TURN_SPEED = 200;
 unsigned long lastBluetoothTime = 0;
-int currentBaseSpeed = 160; // Ito ang default speed
+int currentBaseSpeed = 200; // Ito ang default speed
 int currentTurnSpeed = 220; // Default turn speed
 const unsigned long MOVEMENT_DURATION = 30000;
 // ---------------- V5.3.9: CAMERA NAV HINTS (mula sa FaceRobot app) ----------------
 uint8_t navHint = 0;                       // 0 = wala, 1 = LEFT, 2 = RIGHT, 3 = BACK, 4 = CLEAR
 unsigned long navHintTime = 0;             // millis() nang huling dumating ang hint
 const unsigned long NAV_HINT_TIMEOUT_MS = 700; // kapag mas luma pa dito ang hint, ituring na expired (forward na ulit)
-const int NAV_TURN_SPEED = 150;            // bilis ng spin habang camera-nav (mas mabagal kaysa avoidance turn)
+const int NAV_TURN_SPEED = 200;            // bilis ng spin habang camera-nav (mas mabagal kaysa avoidance turn)
 const bool MOVING_AUTO_STOP_ENABLED = false; // V5.3.8: false = tuloy-tuloy ang STATE_MOVING (walang 30s stop). true = dating behavior
 const unsigned long PIR_ACTIVATION_DELAY = 3000;
 const long detectionCooldown = 5000;
-const int PRESENCE_TRIGGER_CM = 30; // Distansya (cm) na magsasabing "may tao" — kapalit ng PIR sensor
+const int PRESENCE_TRIGGER_CM = 20; // Distansya (cm) na magsasabing "may tao" — kapalit ng PIR sensor
 // ========================= STUCK DETECTION LOGIC (FIXED) =========================
 
 int consecutiveIrTriggers = 0;
@@ -260,8 +340,12 @@ bool isTiredFaceDone = false;
 
 // ========================= MUSIC PLAYER VARIABLES =========================
 int currentSongNumber = 1; // Simulan sa kanta #1
-int totalMusicFiles = 49;  // Kabuuang bilang ng kanta sa SD card
+int totalMusicFiles = 51;  // Kabuuang bilang ng kanta sa SD card
 bool isMusicActive = false;
+// V5.3.14: para sa "PLAYSONG" command - isang beses lang na tugtog ng specific na track sa /MP3
+// folder, may advert intro (advertise+auto-resume), PERO HINDI pumapasok sa tuluy-tuloy na
+// shuffle mode ng isMusicActive. Hiwalay na flag para hindi magkagulo ang dalawang concern na ito.
+bool oneShotSongMode = false;
 static unsigned long lastCheckTime = 0; //
 bool isAdvertPlaying = false; // Para malaman kung nagpe-play ng advert
 unsigned long advertStartTime = 0;
@@ -370,7 +454,7 @@ void playSongTracked(int n) {
 // - may music: i-pause ang kanta, tugtugin ang advert (ADVERT folder), tapos babalik sa parehong kanta
 // - walang music: normal play lang
 void playAdvertOverMusic(uint8_t advertNum) {
-  if (isMusicActive) {
+  if (isMusicActive || oneShotSongMode) {
     if (ADVERT_MIN_GAP_MS > 0 && lastAdvertStartTime != 0 && (millis() - lastAdvertStartTime) < ADVERT_MIN_GAP_MS) {
       Serial.print("[ADVERT] advertise("); Serial.print(advertNum);
       Serial.println(") SKIPPED - masyadong madalas habang may music (ADVERT_MIN_GAP_MS)");
@@ -391,6 +475,31 @@ void playAdvertOverMusic(uint8_t advertNum) {
     myDFPlayer.advertise(advertNum);
   } else {
     myDFPlayer.play(advertNum);
+  }
+}
+
+// ---------------- V5.5.2: ALARM AUDIO (DFPlayer kasabay ng buzzer) ----------------
+// track 1..254: boses/clip ng robot na tutugtog ISANG BESES pagtunog ng alarm (kasabay ng buzzer).
+// track 255: musika (shuffle sa /MP3) bilang alarm.
+void startAlarmMusic() {
+  isMusicActive = true;
+  oneShotSongMode = false;
+  myDFPlayer.play(3);   // gaya ng MUSIC_ON: i-initialize muna ang player
+  delay(2000);
+  isAdvertPlaying = false; resumePending = false; nextCheckPending = false;
+  currentSongNumber = random(1, totalMusicFiles + 1);
+  playSongTracked(currentSongNumber);
+  Serial.print("[ALARM] Music alarm - track "); Serial.println(currentSongNumber);
+}
+
+// Patayin ang audio ng alarm: ang musika ay laging; ang clip ay kung kakasimula pa lang (para hindi maputol ang ibang tinutugtog mo)
+void stopAlarmAudio() {
+  bool clipMaybePlaying = (alarmTrackNum > 0 && alarmTrackNum < 255 && (millis() - alarmAudioStartMs) < 30000UL);
+  if (alarmTrackNum == 255 || clipMaybePlaying) {
+    myDFPlayer.stop();
+    isMusicActive = false;
+    oneShotSongMode = false;
+    isAdvertPlaying = false; resumePending = false; nextCheckPending = false;
   }
 }
 
@@ -535,7 +644,7 @@ void updateBuzzer() {
   if (alarmTriggerTime > 0) {
     if (now < alarmTriggerTime + ALARM_DURATION) {
       if ((now % 800) < 400) {
-        if (toneEndTime == 0 && !isPlayingCurious && !isAvoidBeepActive) {
+        if (!alarmBuzzerMuted && toneEndTime == 0 && !isPlayingCurious && !isAvoidBeepActive) {   // V5.5.2: alarmBuzzerMuted = DFPlayer lang
           buzzTone(ALARM_TONE_FREQ);
         }
       } else {
@@ -544,6 +653,7 @@ void updateBuzzer() {
     } else {
       buzzOff();
       alarmTriggerTime = 0;
+      if (alarmTrackNum == 255) stopAlarmAudio();   // V5.5.2: musika bilang alarm - huminto rin pagkatapos ng 2 minuto
       Serial.println("Alarm tone ended after 2 minute.");
     }
   }
@@ -651,6 +761,90 @@ void displayTime() {
   display.display();
 }
 
+// ========================= ALARM SYSTEM (V5.5.0) =========================
+
+void saveAlarms() {
+  alarmPrefs.putBytes("slots", alarms, sizeof(alarms));
+}
+
+void loadAlarms() {
+  alarmPrefs.begin("alarms", false);
+  memset(alarms, 0, sizeof(alarms));
+  for (int i = 0; i < MAX_ALARMS; i++) alarmLastFiredMin[i] = -1;
+  size_t len = alarmPrefs.getBytesLength("slots");
+  if (len == sizeof(alarms)) {
+    alarmPrefs.getBytes("slots", alarms, sizeof(alarms));
+    for (int i = 0; i < MAX_ALARMS; i++) {
+      alarms[i].label[sizeof(alarms[i].label) - 1] = 0;
+      if (alarms[i].hour > 23 || alarms[i].minute > 59) alarms[i].used = 0;
+    }
+  } else {
+    // Unang boot (o nagbago ang format): ibalik ang dating 6:00 AM araw-araw
+    alarms[0].used = 1;
+    alarms[0].enabled = 1;
+    alarms[0].hour = 6;
+    alarms[0].minute = 0;
+    alarms[0].days = 0;
+    alarms[0].once = 0;
+    alarms[0].track = 0;
+    strcpy(alarms[0].label, "Gising");
+    saveAlarms();
+  }
+}
+
+// idx = -1 -> galing sa snooze
+void triggerAlarm(int idx) {
+  isAlarmTriggeredToday = true;
+  alarmTriggerTime = millis();
+  if (alarmTriggerTime == 0) alarmTriggerTime = 1;
+  pirDisableUntil = millis() + PIR_DISABLE_DURATION;
+  pitDisableUntil = millis() + PIT_DISABLE_DURATION;
+
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  Serial.print("!!! ALARM TRIGGERED: WAKE UP! ");
+  if (idx >= 0) { Serial.print("#"); Serial.print(idx); Serial.print(" "); Serial.print(alarms[idx].label); }
+  else Serial.print("(snooze)");
+  Serial.println(" !!!");
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+
+  isAvoidBeepActive = false;
+  isPlayingCurious = false;
+  toneEndTime = 0;
+  buzzOff(); // Stop any avoidance beeps
+
+  // WAKE-UP ROUTINE (if sleeping from IR only)
+
+  if (currentState == STATE_SLEEPING_IR || currentState == STATE_SLEEP_ALERT) {
+    display.clearDisplay();
+    playBootSound_NB();
+    roboEyes.setMood(HAPPY);
+    roboEyes.setAutoblinker(ON, 3, 2);
+    roboEyes.setIdleMode(ON, 2, 2);
+    roboEyes.setCuriosity(ON);
+    isTiredFaceDone = false;
+    currentState = STATE_MOVING;
+    movementStartTime = millis();
+    ipScreenNeedsDraw = true; // V5.3.4: siguraduhing mag-redraw ang IP screen pagkatapos ng clearDisplay
+    Serial.println("Robot WOKE UP via ALARM!");
+  } else {
+    roboEyes.setMood(HAPPY);
+    roboEyes.anim_laugh();
+  }
+
+  // V5.5.2: DFPlayer KASABAY ng buzzer. Snooze (idx = -1) ay ginagamit ang huling alarm.
+  if (idx >= 0) {
+    alarmTrackNum = alarms[idx].track;
+    alarmBuzzerMuted = false;   // V5.5.3: PERMANENTE - kasabay ng DFPlayer track ang buzzer
+  }
+  alarmAudioStartMs = millis();
+  if (alarmTrackNum == 255) {
+    if (!isMusicActive) startAlarmMusic();      // musika bilang alarm (shuffle), kasabay ng buzzer
+  } else if (alarmTrackNum > 0) {
+    lastAdvertStartTime = 0;                    // iwasan ang ADVERT_MIN_GAP_MS
+    playAdvertOverMusic(alarmTrackNum);         // ISANG BESES lang (boses ng robot) - kasabay ng buzzer
+  }
+}
+
 // ========================= ALARM CHECK FUNCTION =========================
 
 void checkAlarm() {
@@ -659,62 +853,33 @@ void checkAlarm() {
   if (millis() - lastAlarmCheck < 1000) return;
   lastAlarmCheck = millis();
 
-  if (WiFi.status() != WL_CONNECTED) return; // Skip alarm check kung offline
-  
+  // V5.5.0: hindi na kailangan ang WiFi - basta may tamang oras na (NTP o galing sa app), tutunog ang alarm.
   struct tm timeinfo;
   if (!getLocalTimeNB(&timeinfo)) return;
+  time_t nowT;
+  time(&nowT);
 
-  if (!isAlarmSet) return;
-  
-  if (!getLocalTimeNB(&timeinfo)) {
+  // Snooze: tumunog ulit paglampas ng oras
+  if (snoozeUntil > 0 && nowT >= snoozeUntil) {
+    snoozeUntil = 0;
+    triggerAlarm(-1);
     return;
   }
 
-  // =======================Midnight Reset=====================================
-
-  if (isAlarmTriggeredToday && (timeinfo.tm_hour == 0 && timeinfo.tm_min == 1)) {
-    isAlarmTriggeredToday = false;
-    Serial.println("Alarm state reset for the new day.");
-  }
-
-  // =======================Alarm Time============================================
-
-  if (!isAlarmTriggeredToday &&
-      timeinfo.tm_hour == ALARM_HOUR &&
-      timeinfo.tm_min == ALARM_MINUTE) {
-    isAlarmTriggeredToday = true;
-    alarmTriggerTime = millis();
-    pirDisableUntil = millis() + PIR_DISABLE_DURATION;
-    pitDisableUntil = millis() + PIT_DISABLE_DURATION;
-
-    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    Serial.println("!!! ALARM TRIGGERED: 🔔 WAKE UP! 🔔 !!!");
-    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    
-    isAvoidBeepActive = false;
-    isPlayingCurious = false;
-    toneEndTime = 0;
-    buzzOff(); // Stop any avoidance beeps
-
-    // WAKE-UP ROUTINE (if sleeping from IR only)
-
-    if (currentState == STATE_SLEEPING_IR || currentState == STATE_SLEEP_ALERT) {
-      display.clearDisplay();
-      playBootSound_NB();
-      roboEyes.setMood(HAPPY);
-      roboEyes.setAutoblinker(ON, 3, 2);
-      roboEyes.setIdleMode(ON, 2, 2);
-      roboEyes.setCuriosity(ON);
-      isTiredFaceDone = false;
-      currentState = STATE_MOVING;
-      movementStartTime = millis();
-      ipScreenNeedsDraw = true; // V5.3.4: siguraduhing mag-redraw ang IP screen pagkatapos ng clearDisplay
-      Serial.println("Robot WOKE UP via ALARM!");
-    } else {
-
-      roboEyes.setMood(HAPPY);
-      roboEyes.anim_laugh();
+  long nowMin = (long)(nowT / 60);
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    AlarmSlot &a = alarms[i];
+    if (!a.used || !a.enabled) continue;
+    if (timeinfo.tm_hour != a.hour || timeinfo.tm_min != a.minute) continue;
+    if (a.days != 0 && !(a.days & (1 << timeinfo.tm_wday))) continue;
+    if (alarmLastFiredMin[i] == nowMin) continue;   // tumunog na sa minutong ito
+    alarmLastFiredMin[i] = nowMin;
+    if (a.once) {
+      a.enabled = 0;     // isang beses lang: i-OFF pagkatapos (nananatili sa listahan)
+      saveAlarms();
     }
+    triggerAlarm(i);
+    break;               // isang alarm lang bawat segundo
   }
 }
 
@@ -806,14 +971,46 @@ const char* stateName(RobotState st) {
   }
 }
 
+// V5.4.0: Binabasa ang pit sensors at "idinidikit" ang resulta ng PIT_LATCH_MS para hindi ma-miss ng app.
+// Tinatawag sa loop() at bago sumagot ang /ping (para sariwa ang basa).
+void updatePit() {
+  bool l = (digitalRead(IR_SENSOR_LEFT)  == IR_PIT_ACTIVE_LEVEL);
+  bool r = (digitalRead(IR_SENSOR_RIGHT) == IR_PIT_ACTIVE_LEVEL);
+  unsigned long now = millis();
+  if (l || r) {
+    pitLatchUntil = now + PIT_LATCH_MS;
+    if (l) pitLatchedLeft = true;
+    if (r) pitLatchedRight = true;
+  } else if ((long)(now - pitLatchUntil) > 0) {
+    pitLatchedLeft = false;
+    pitLatchedRight = false;
+  }
+}
+
+// "L", "R", "LR" kapag may pit; "0" kapag wala
+String pitCode() {
+  if ((long)(millis() - pitLatchUntil) > 0) return "0";
+  String c = "";
+  if (pitLatchedLeft)  c += "L";
+  if (pitLatchedRight) c += "R";
+  return c.length() ? c : "0";
+}
+
 void handlePing() {
   onAppContact();
-  server.send(200, "text/plain", String("PONG|") + stateName(currentState));
+  updatePit();
+  // V5.4.0: "PONG|<STATE>|PIT=<L|R|LR|0>" - ang lumang app na STATE lang ang binabasa ay hindi masisira
+  struct tm tvInfo;   // V5.5.0
+  bool timeOk = getLocalTimeNB(&tvInfo);
+  server.send(200, "text/plain", String("PONG|") + stateName(currentState) + "|PIT=" + pitCode() +
+              "|ALARM=" + (alarmTriggerTime > 0 ? "1" : "0") +   // 1 = tumutunog ang alarm
+              "|TV=" + (timeOk ? "1" : "0"));                      // 1 = may tamang oras na (NTP o galing sa app)
 }
 
 void setup() {
   Serial.begin(115200);
   loadSongDurations();
+  loadAlarms();   // V5.5.0
   delay(1000);
 
   WiFi.disconnect(true);
@@ -841,22 +1038,22 @@ liftServo.write(currentServoAngle); // simulan sa DOWN position
 
   // 2. Initialize ESP-NOW
   if (esp_now_init() != 0) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
+    Serial.println("Error initializing ESP-NOW (tuloy ang boot)");   // V5.5.1: hindi na nag-return - kailangan pang matapos ang setup()
   }
 
   // 3. I-register ang S3 bilang partner (peer)
   esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));   // V5.5.1: dati hindi naka-zero -> random ang ifidx -> "Peer interface is invalid"
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.ifidx = WIFI_IF_STA;
   peerInfo.channel = 0;  // Dapat pareho ang channel kung gagamit ng router
   peerInfo.encrypt = false;
   
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add peer");
-    return;
+    Serial.println("Failed to add peer (tuloy ang boot)");   // V5.5.1: hindi na nag-return - ang maagang return ang sanhi ng crash sa loop()
   }
   
-  Serial.println("Robot Sender Ready!");
+  else Serial.println("Robot Sender Ready!");
 //  ==================== END ESP-NOW SETUP =========================
 
   // FIX: I-initialize muna ang I2C bus (Wire.begin()) BAGO tawagin ang setClock()/
@@ -1083,6 +1280,200 @@ long getDistance() {
   return duration * 0.034 / 2;
 }
 
+// V5.3.14: case-insensitive na paghahanap ng query param - proteksyon laban sa
+// autocapitalize/autocorrect ng keyboard sa Android app (h
+// biglang mag-mangle ng case ng custom action text na tina-type sa "Mga Utos" dialog.
+bool hasArgCI(const String& name) {
+  for (int i = 0; i < server.args(); i++) {
+    if (server.argName(i).equalsIgnoreCase(name)) return true;
+  }
+  return false;
+}
+String getArgCI(const String& name) {
+  for (int i = 0; i < server.args(); i++) {
+    if (server.argName(i).equalsIgnoreCase(name)) return server.arg(i);
+  }
+  return "";
+}
+
+// ========================= ALARM COMMANDS (V5.5.0) =========================
+// Lahat ng ALARM_* ay sumasagot ng JSON na may kasalukuyang listahan, para ang app ay laging may tamang larawan.
+
+String sanitizeAlarmLabel(const String& in) {
+  String out = "";
+  for (unsigned int i = 0; i < in.length() && out.length() < 15; i++) {
+    char c = in[i];
+    if (c >= 32 && c < 127 && c != '"' && c != '\\') out += c;   // ASCII lang, walang quote (JSON-safe)
+  }
+  return out;
+}
+
+String alarmJsonAll(int setId) {
+  struct tm ti;
+  bool valid = getLocalTimeNB(&ti);
+  time_t nowT;
+  time(&nowT);
+  String s = "{\"valid\":";
+  s += (valid ? "1" : "0");
+  s += ",\"now\":"; s += String((unsigned long)nowT);
+  s += ",\"ringing\":"; s += (alarmTriggerTime > 0 ? "1" : "0");
+  s += ",\"snooze\":"; s += (snoozeUntil > 0 ? "1" : "0");
+  s += ",\"set\":"; s += String(setId);
+  s += ",\"alarms\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    if (!alarms[i].used) continue;
+    if (!first) s += ",";
+    first = false;
+    s += "{\"id\":"; s += String(i);
+    s += ",\"h\":"; s += String((int)alarms[i].hour);
+    s += ",\"m\":"; s += String((int)alarms[i].minute);
+    s += ",\"days\":"; s += String((int)alarms[i].days);
+    s += ",\"once\":"; s += String((int)alarms[i].once);
+    s += ",\"on\":"; s += String((int)alarms[i].enabled);
+    s += ",\"track\":"; s += String((int)alarms[i].track);
+    s += ",\"label\":\""; s += alarms[i].label; s += "\"}";
+  }
+  s += "]}";
+  return s;
+}
+
+// true = ang command ay alarm/oras command at nasagot na.
+bool handleAlarmCommand(const String& dir) {
+  if (dir == "ALARM_LIST") {
+    server.send(200, "application/json", alarmJsonAll(-1));
+    return true;
+  }
+
+  if (dir == "ALARM_SET") {
+    if (!hasArgCI("h") || !hasArgCI("m")) {
+      server.send(400, "text/plain", "ERR: kailangan ang h at m");
+      return true;
+    }
+    int h = getArgCI("h").toInt();
+    int m = getArgCI("m").toInt();
+    if (h < 0 || h > 23 || m < 0 || m > 59) {
+      server.send(400, "text/plain", "ERR: maling oras");
+      return true;
+    }
+    uint8_t days = hasArgCI("days") ? (uint8_t)(getArgCI("days").toInt() & 0x7F) : 0;
+    uint8_t once = hasArgCI("once") ? (getArgCI("once").toInt() ? 1 : 0) : 0;
+    int track = hasArgCI("track") ? constrain(getArgCI("track").toInt(), 0, 255) : 0;
+    uint8_t flags = 0;   // V5.5.3: PERMANENTE - palaging kasabay ng DFPlayer ang buzzer (walang opsyon na patayin)
+    String label = sanitizeAlarmLabel(getArgCI("label"));
+
+    int slot = -1;
+    if (hasArgCI("id")) {
+      int id = getArgCI("id").toInt();
+      if (id >= 0 && id < MAX_ALARMS) slot = id;           // i-update ang umiiral
+    }
+    if (slot < 0) {
+      for (int i = 0; i < MAX_ALARMS; i++) {                // walang dobleng alarm sa parehong oras/araw
+        if (alarms[i].used && alarms[i].hour == h && alarms[i].minute == m &&
+            alarms[i].days == days && alarms[i].once == once) { slot = i; break; }
+      }
+    }
+    if (slot < 0) {
+      for (int i = 0; i < MAX_ALARMS; i++) {
+        if (!alarms[i].used) { slot = i; break; }
+      }
+    }
+    if (slot < 0) {
+      server.send(409, "text/plain", "ERR: FULL (8 alarm na)");
+      return true;
+    }
+    alarms[slot].used = 1;
+    alarms[slot].enabled = 1;
+    alarms[slot].hour = (uint8_t)h;
+    alarms[slot].minute = (uint8_t)m;
+    alarms[slot].days = days;
+    alarms[slot].once = once;
+    alarms[slot].track = (uint8_t)track;
+    alarms[slot].flags = flags;
+    memset(alarms[slot].label, 0, sizeof(alarms[slot].label));
+    strncpy(alarms[slot].label, label.c_str(), sizeof(alarms[slot].label) - 1);
+    alarmLastFiredMin[slot] = -1;
+    saveAlarms();
+    Serial.print("⏰ ALARM_SET #"); Serial.print(slot); Serial.print(" "); Serial.print(h); Serial.print(":"); Serial.println(m);
+    server.send(200, "application/json", alarmJsonAll(slot));
+    return true;
+  }
+
+  if (dir == "ALARM_DEL") {
+    String id = getArgCI("id");
+    if (id.equalsIgnoreCase("ALL")) {
+      memset(alarms, 0, sizeof(alarms));
+    } else {
+      int i = id.toInt();
+      if (!hasArgCI("id") || i < 0 || i >= MAX_ALARMS || !alarms[i].used) {
+        server.send(404, "text/plain", "ERR: walang ganung alarm");
+        return true;
+      }
+      alarms[i].used = 0;
+    }
+    saveAlarms();
+    server.send(200, "application/json", alarmJsonAll(-1));
+    return true;
+  }
+
+  if (dir == "ALARM_ENABLE") {
+    int i = getArgCI("id").toInt();
+    if (!hasArgCI("id") || i < 0 || i >= MAX_ALARMS || !alarms[i].used) {
+      server.send(404, "text/plain", "ERR: walang ganung alarm");
+      return true;
+    }
+    alarms[i].enabled = getArgCI("on").toInt() ? 1 : 0;
+    alarmLastFiredMin[i] = -1;
+    saveAlarms();
+    server.send(200, "application/json", alarmJsonAll(i));
+    return true;
+  }
+
+  if (dir == "ALARM_STOP") {
+    alarmTriggerTime = 0;
+    snoozeUntil = 0;
+    buzzOff();
+    stopAlarmAudio();
+    server.send(200, "application/json", alarmJsonAll(-1));
+    return true;
+  }
+
+  if (dir == "ALARM_SNOOZE") {
+    int mins = hasArgCI("min") ? constrain(getArgCI("min").toInt(), 1, 60) : 5;
+    alarmTriggerTime = 0;
+    buzzOff();
+    stopAlarmAudio();
+    time_t nowT;
+    time(&nowT);
+    snoozeUntil = nowT + (time_t)mins * 60;
+    server.send(200, "application/json", alarmJsonAll(-1));
+    return true;
+  }
+
+  if (dir == "SETTIME") {
+    // Para sa ESP32 na walang NTP (walang internet): ang app ang nagbibigay ng oras (unix seconds, UTC).
+    struct tm ti;
+    bool valid = getLocalTimeNB(&ti);
+    bool force = hasArgCI("force") && getArgCI("force").toInt() != 0;
+    if (hasArgCI("epoch") && (!valid || force)) {
+      long long epoch = atoll(getArgCI("epoch").c_str());
+      if (epoch > 1500000000LL) {
+        setenv("TZ", "PST-8", 1);   // GMT+8 (Pilipinas)
+        tzset();
+        struct timeval tv;
+        tv.tv_sec = (time_t)epoch;
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+        Serial.println("🕒 SETTIME mula sa app");
+      }
+    }
+    server.send(200, "application/json", alarmJsonAll(-1));
+    return true;
+  }
+
+  return false;
+}
+
 // ========================= FACE-TRACKING HTTP COMMAND HANDLER =========================
 // Tumatanggap ng commands mula sa Android FaceRobot app
 // (http://<esp32-ip>/command?dir=FORWARD|BACKWARD|LEFT|RIGHT|STOP|SEARCH)
@@ -1099,14 +1490,23 @@ void handleCommand() {
 
   String dir = server.arg("dir");
     onAppContact();
+    if (handleAlarmCommand(dir)) return;   // V5.5.0: ALARM_* / SETTIME (anumang state)
 
-  if (dir == "FORCE_STOP") {
+    if (dir == "FORCE_STOP") {
+    // Opsyonal na &track=N mula sa app (hal. galing sa custom command na "tigil || stop").
+    // Walang track = default na 10 ("Yes Boss"). track=0 = walang tutugtog.
+    int stopTrack = 10;
+    if (server.hasArg("track")) stopTrack = server.arg("track").toInt();
+
+    alarmTriggerTime = 0;   // V5.5.0: ang "hinto" ay pinapatay rin ang tumutunog na alarm
+    snoozeUntil = 0;
     myDFPlayer.stop();
     stopBot();
     buzzOff();
-    myDFPlayer.play(10); // Play the "Yes Boss" advert
+    if (stopTrack > 0) myDFPlayer.play(stopTrack);
     navHint = 0; // V5.3.9
     isMusicActive = false;
+    oneShotSongMode = false;
     danceStartTime = 0;
     digitalWrite(LED_PIN, LOW);
     ledState = LOW;
@@ -1116,7 +1516,8 @@ void handleCommand() {
     lastFaceCommandTime = millis();
     server.send(200, "text/plain", "OK: FORCE_STOP");
     return;
-}
+  }
+
 
 // V5.3.6: AUTO - tinatanggap sa ANUMANG state (hindi na kailangan STATE_BOOT_WAIT).
 // Dati, kapag nasa STATE_PIR_ACTIVE_AND_DETECTING / SHAKING / EXPRESSION / DANCING / SLEEPING ang robot,
@@ -1177,9 +1578,91 @@ else if (dir.startsWith("NAV_")) {
     return;
 }
 
+// V5.4.0: SAY - itugtog ang DFPlayer track sa ANUMANG state (pit reaction ng app: "Ay nako, mahuhulog pala ako dito!").
+// Pareho ng GREET/PLAY pero hindi naka-gate sa STATE_BOOT_WAIT, kaya gumagana kahit MOVING/AVOIDING.
+else if (dir == "SAY") {
+    if (server.hasArg("track")) {
+      int trackNum = server.arg("track").toInt();
+      playAdvertOverMusic(trackNum);
+      Serial.print("🔊 Face-Track: SAY TRACK ");
+      Serial.println(trackNum);
+    }
+    server.send(200, "text/plain", "OK: SAY");
+    return;
+}
+
+// V5.4.0: SERVO - camera tilt LANG sa ANUMANG state (walang galaw ng motor). Para sa "tumingin sa baba" ng app.
+else if (dir == "SERVO") {
+    if (server.hasArg("servo")) {
+      setServoAngle(server.arg("servo").toInt());
+    }
+    server.send(200, "text/plain", "OK: SERVO");
+    return;
+}
+
+// V5.4.4: SHAKE&ms=N - maikling alog (default 100ms). Gumagana lang sa STATE_BOOT_WAIT at hindi kapag may pit.
+else if (dir == "SHAKE") {
+    int ms = server.hasArg("ms") ? server.arg("ms").toInt() : 100;
+    if (ms < 40) ms = 40;
+    if (ms > 1500) ms = 1500;
+    bool pitNow = (digitalRead(IR_SENSOR_LEFT) == IR_PIT_ACTIVE_LEVEL) || (digitalRead(IR_SENSOR_RIGHT) == IR_PIT_ACTIVE_LEVEL);
+    if (currentState == STATE_BOOT_WAIT && !pitNow) {
+      stopBot();
+      shakeStepMs = 25;
+      shakeDuration = ms;
+      shakeStartTime = millis();
+      currentState = STATE_SHAKING;
+      Serial.print("🤖 SHAKE burst ms=");
+      Serial.println(ms);
+    }
+    server.send(200, "text/plain", "OK: SHAKE");
+    return;
+}
+
+// V5.4.3: WAKE - gisingin ang ESP32 mula sa sleep papunta sa STATE_BOOT_WAIT (tahimik, walang advert/boot sound).
+else if (dir == "WAKE") {
+    if (currentState == STATE_SLEEPING_IR || currentState == STATE_SLEEP_ALERT || currentState == STATE_SLEEP_ULTRASONIC_OSC) {
+      stopBot();
+      buzzOff();
+      alarmTriggerTime = 0;
+      sleepAvoidActive = false;
+      isTiredFaceDone = false;
+      consecutiveIrTriggers = 0;   // para hindi agad bumalik sa "stuck" sleep
+      navHint = 0;
+      isPirDetectionActive = false;
+      display.clearDisplay();
+      roboEyes.setMood(DEFAULT);
+      roboEyes.setAutoblinker(ON, 3, 2);
+      roboEyes.setIdleMode(ON, 2, 2);
+      roboEyes.setCuriosity(ON);
+      ipScreenNeedsDraw = true;
+      currentState = STATE_BOOT_WAIT;
+      lastFaceCommandTime = millis();
+      Serial.println("⏰ WAKE: gising mula sa sleep -> STATE_BOOT_WAIT");
+    }
+    server.send(200, "text/plain", "OK: WAKE");
+    return;
+}
+
+// V5.4.2: SLEEP_ON / SLEEP_OFF - sleep mode ng app. Ang SLEEP_ON ay inuulit ng app (heartbeat) habang tulog.
+else if (dir == "SLEEP_ON") {
+    if (!appSleeping() && currentState == STATE_BOOT_WAIT) {
+      stopBot();   // kakatulog pa lang: huminto kung may ginagawang galaw
+    }
+    appSleepUntil = millis() + APP_SLEEP_HOLD_MS;
+    server.send(200, "text/plain", "OK: SLEEP_ON");
+    return;
+}
+else if (dir == "SLEEP_OFF") {
+    appSleepUntil = 0;
+    server.send(200, "text/plain", "OK: SLEEP_OFF");
+    return;
+}
+
 else if (dir == "MUSIC_ON") {
     Serial.println("🎵 Face-Track: MUSIC MODE ON (shuffle)");
     isMusicActive = true;
+    oneShotSongMode = false; // tuluy-tuloy na shuffle na ito, hindi one-shot
     myDFPlayer.play(3); // Play the first track to initialize
     delay(2000); // Wait for 2 seconds to ensure the player is ready
     currentSongNumber = random(1, totalMusicFiles + 1);
@@ -1189,6 +1672,7 @@ else if (dir == "MUSIC_ON") {
 else if (dir == "MUSIC_OFF") {
     Serial.println("🎵 Face-Track: MUSIC MODE OFF");
     isMusicActive = false;
+    oneShotSongMode = false;
     myDFPlayer.stop();
     roboEyes.setMood(DEFAULT);
 }
@@ -1219,7 +1703,14 @@ else if (dir == "MUSIC_NEXT") {
 
   // --- DIRECTION & ACTION COMMANDS ---
   if (dir == "FORWARD") {
-    if (leftPit || rightPit) {
+    if ((long)(pitBackoffUntil - millis()) > 0) {
+      // V5.4.1: umaatras pa dahil sa pit - ang loop() ang may hawak ng motor, huwag makialam
+    }
+    else if ((long)(pitForwardLockUntil - millis()) > 0) {
+      // V5.4.1: kaaatras lang dahil sa pit - huwag munang sumulong pabalik doon (pwede pang lumiko)
+      stopBot();
+    }
+    else if (leftPit || rightPit) {
       Serial.println("⚠️ Forward blocked! Pit detected.");
       stopBot();
       roboEyes.setMood(ANGRY);
@@ -1259,6 +1750,23 @@ else if (dir == "MUSIC_NEXT") {
       playAdvertOverMusic(trackNum); // V5.3.10: may music = advertise (pause+resume), walang music = play
       Serial.print("🔊 Face-Track: PLAY TRACK ");
       Serial.println(trackNum);
+    }
+}
+  // V5.3.14: PLAYSONG - itugtog ang SPECIFIC na track sa /MP3 folder nang ISANG BESES LANG, may
+  // advert intro (default track 3, pwede palitan via &advert=N), tapos AWTOMATIKONG babalik sa
+  // kantang ito pagkatapos ng advert. HINDI ito pumapasok sa tuluy-tuloy na shuffle mode (gamitin
+  // ang MUSIC_ON para doon) - kapag natapos nang natural ang kanta, titigil na lang, walang next.
+  // Halimbawa mula sa app: /command?dir=PLAYSONG&track=21 (opsyonal: &advert=5)
+  else if (dir == "PLAYSONG") {
+    if (hasArgCI("track")) {
+      int trackNum = getArgCI("track").toInt();
+      int advertNum = hasArgCI("advert") ? getArgCI("advert").toInt() : 3;
+      oneShotSongMode = true;
+      playSongTracked(trackNum);       // simulan ang kanta mula sa /MP3 folder
+      playAdvertOverMusic(advertNum);  // i-overlay ang advert, babalik dito pagkatapos
+      Serial.print("🎵 Face-Track: PLAYSONG TRACK ");
+      Serial.print(trackNum);
+      Serial.print(" (advert intro "); Serial.print(advertNum); Serial.println(")");
     }
 }
   else if (dir == "BACKWARD") {
@@ -1358,6 +1866,7 @@ else if (dir == "MUSIC_NEXT") {
 void loop() {
   unsigned long now = millis();
   updateServo();
+  updatePit();   // V5.4.0: pit latch para sa /ping
   checkAlarm();
   updateBuzzer();
   handle_bluetooth_data();
@@ -1393,7 +1902,7 @@ if (myDFPlayer.available()) {
             isAdvertPlaying = false;
             advertGuardUntil = t + 1500;   // ignore ang anumang extra event pagkatapos nito
             Serial.println("Advert done. Resuming music (no next)...");
-            if (isMusicActive) {
+            if (isMusicActive || oneShotSongMode) {
                 resumePending = true;
                 resumeStage = 1;
                 resumeAt = t + 600;   // bigyan ng oras ang DFPlayer na mag-auto-resume
@@ -1418,6 +1927,11 @@ if (myDFPlayer.available()) {
             Serial.print(advertsThisSong);
             Serial.println(") -> verifying DFPlayer state...");
         }
+        else if (oneShotSongMode) {
+            oneShotSongMode = false;
+            Serial.print("[ONE-SHOT] Track "); Serial.print(value);
+            Serial.println(" natapos nang natural. Idle na, walang shuffle.");
+        }
         else {
             Serial.print("Sound ");
             Serial.print(value);
@@ -1431,7 +1945,7 @@ if (myDFPlayer.available()) {
 // Ang dating start() ay nagre-restart ng kasalukuyang kanta mula sa umpisa = "inuulit ang kanta".
 // Ngayon: playing = ayos na | paused = start() | stopped = tapos na ang kanta -> NEXT (hindi start()).
 if (resumePending && (long)(millis() - resumeAt) >= 0) {
-    if (!isMusicActive || isAdvertPlaying) {
+    if ((!isMusicActive && !oneShotSongMode) || isAdvertPlaying) {
         resumePending = false;   // na-stop ang music o may bagong advert
     } else {
         int stRaw = myDFPlayer.readState();                 // 512 stopped, 513 playing, 514 paused
@@ -1452,6 +1966,13 @@ if (resumePending && (long)(millis() - resumeAt) >= 0) {
             resumeStage = 2;
             resumeAt = millis() + 800;   // baka nasa gitna pa ng resume, tingnan ulit
         }
+        else if (oneShotSongMode) {
+            // One-shot track: STOPPED pagkatapos ng advert = natapos na pala ang kanta habang
+            // may advert - HUWAG mag-shuffle, titigil na lang (iba ito sa normal shuffle mode).
+            resumePending = false;
+            oneShotSongMode = false;
+            Serial.println("[RESUME] One-shot track natapos na habang may advert - titigil, walang shuffle.");
+        }
         else {
             resumePending = false;
             // STOPPED pagkatapos ng advert = natapos na ang kanta habang may advert -> next, HUWAG i-restart
@@ -1465,7 +1986,7 @@ if (resumePending && (long)(millis() - resumeAt) >= 0) {
 }
 
 // SONG WATCHDOG: kapag lumampas na sa haba ng kanta pero walang "finished" event -> FORCE NEXT
-{
+/*{
     unsigned long tickNow = millis();
     unsigned long dt = tickNow - lastSongTick;
     lastSongTick = tickNow;
@@ -1485,7 +2006,7 @@ if (resumePending && (long)(millis() - resumeAt) >= 0) {
             Serial.println(currentSongNumber);
         }
     }
-}
+}*/
 
 // VERIFY: totoo bang tapos na ang kanta? (2 beses titingnan bago mag-next)
 if (nextCheckPending && (long)(millis() - nextCheckAt) >= 0) {
@@ -1531,42 +2052,12 @@ if (isAdvertPlaying && (millis() - advertStartTime > ADVERT_DURATION)) {
     advertGuardUntil = millis() + 1500;
 }
 
-  // --- BUTTON DEBOUNCING LOGIC ---
-
-//  int reading = digitalRead(BUTTON_WAKEUP);
-//  if (reading != lastButtonState) {
-//    lastButtonDebounceTime = now;
-//  }
-
-//  if ((now - lastButtonDebounceTime) > DEBOUNCE_DELAY) {
-//    if (reading != buttonState) {
-//      buttonState = reading;
-
-//      if (buttonState == LOW && currentState == STATE_BOOT_WAIT) {
-//  display.clearDisplay();
-//  buzzOff();
-//  playBootSound_NB();
-
-//  roboEyes.setMood(HAPPY);
-//  roboEyes.setAutoblinker(ON, 3, 2);
-//  roboEyes.setIdleMode(ON, 2, 2);
-//  roboEyes.setCuriosity(ON);
-
-//  movementStartTime = now;
-//  currentState = STATE_MOVING;
-
-//  Serial.println("✅ WAKE BUTTON PRESSED — Robot STARTING!");
-//}
-//    }
-//  }
-//  lastButtonState = reading;
-
   if (currentState == STATE_SHAKING) {
     unsigned long elapsed = millis() - shakeStartTime;
     
     // Gagamit tayo ng variable na 'shakeDuration' imbes na fixed na 3000
     if (elapsed < shakeDuration) { 
-      if ((elapsed / 150) % 2 == 0) {
+      if ((elapsed / shakeStepMs) % 2 == 0) {
         turnLeft();
       } else {
         turnRight();
@@ -1576,52 +2067,10 @@ if (isAdvertPlaying && (millis() - advertStartTime > ADVERT_DURATION)) {
       roboEyes.setMood(DEFAULT);
       currentState = STATE_BOOT_WAIT;
       shakeDuration = 3000; // I-reset sa default (3s) para sa susunod na command
+      shakeStepMs = 150;    // V5.4.4: ibalik sa dating bilis ng alog
       Serial.println("Shake finished!");
     }
 }
-
-  // ====== NEW: DANCE BUTTON TRIGGER LOGIC (GPIO 5) ======
-
-//  int danceReading = digitalRead(BUTTON_DANCE);
-
-  // Assume same debounce variables are reused for simplicity if no conflict
-  // If you want separate debouncing, you need to declare new global variables.
-
-//  if (danceReading == LOW && currentState == STATE_SLEEPING_IR) {
-    // Button is pressed and robot is sleeping
-//    danceStartTime = now;
-//    lastDanceStepTime = now;
-//    danceStep = 0; // Simulan sa Atras/Abante
-
-    // WAKE-UP/START DANCE ROUTINE
-//    display.clearDisplay();
-//    alarmTriggerTime = 0;
-//    buzzOff();
-//    playBootSound_NB();
-//    roboEyes.setMood(HAPPY);
-//    roboEyes.anim_laugh();
-//    roboEyes.setAutoblinker(ON, 2, 1);
-//    roboEyes.setIdleMode(ON, 1, 1);
-//    roboEyes.setCuriosity(OFF);
-//    isTiredFaceDone = false;
-
-//    currentState = STATE_DANCING;
-//    Serial.println("💃 Dance Mode Activated by Button 5! Time to Party!");
-//  }
-
-  //int ldrValue = analogRead(LDR_PIN);
-
- // --- LDR HEADLIGHT BEHAVIOR ---
-// Dagdagan natin ng check: "Dapat HINDI STATE_DANCING"
- //if (currentState != STATE_DANCING) { 
-   //int ldrValue = analogRead(LDR_PIN);
-
-   //if (ldrValue > HEADLIGHT_THRESHOLD) {
-     //digitalWrite(LED_PIN, HIGH);
-   //} else {
-     //digitalWrite(LED_PIN, LOW);
-   //}
- //}
 
   // --- ULTRASONIC NON-BLOCKING UPDATE (LAG FIX) ---
 
@@ -2358,7 +2807,7 @@ case STATE_BOOT_WAIT: {
   bool pirDetected = (distance > 0 && distance < PRESENCE_TRIGGER_CM);
   static unsigned long lastPIRTriggerTime = 0;
 
-  if (pirDetected) {
+  if (pirDetected && !appSleeping()) {   // V5.4.2: tulog ang app = walang presence trigger (advert + shake)
     if (millis() - lastPIRTriggerTime > 900000) {
       Serial.println("ULTRASONIC: Presence detected!");
       playAdvertOverMusic(11); // may music = pause + advert (ADVERT/0011.mp3) + resume; walang music = play(11) sa root
@@ -2376,13 +2825,27 @@ case STATE_BOOT_WAIT: {
   // Ngayon kasama na ang ULTRASONIC (distansya) bukod sa pit sensors
   bool bwLeftPit = digitalRead(IR_SENSOR_LEFT);
   bool bwRightPit = digitalRead(IR_SENSOR_RIGHT);
-  bool bwTooCloseUltra = (distance > 0 && distance < 5);
+  bool bwTooCloseUltra = (distance > 0 && distance < 5) && !appSleeping();   // V5.4.2: walang ultrasonic atras kapag tulog
 
-  if (bwLeftPit == HIGH || bwRightPit == HIGH || bwTooCloseUltra) {
+  // V5.4.1: Habang may pit, i-refresh ang back-off timer; pagkawala ng pit, aatras pa rin hanggang matapos
+  // ang PIT_BACKOFF_EXTRA_MS para lumayo sa gilid (hindi huminto mismo sa bangin).
+  bool bwPitNow = (bwLeftPit == HIGH || bwRightPit == HIGH);
+  if (bwPitNow) {
+    pitBackoffUntil = millis() + PIT_BACKOFF_EXTRA_MS;
+    pitForwardLockUntil = pitBackoffUntil + PIT_FORWARD_LOCK_MS;
+  }
+  bool bwBackingOff = ((long)(pitBackoffUntil - millis()) > 0);
+
+  if (bwPitNow || bwTooCloseUltra || bwBackingOff) {
     currentBaseSpeed = 180;
     reverse();
     roboEyes.setMood(ANGRY);
     lastFaceCommandTime = 0;  // i-clear para di agad bumalik sa face-follow habang aatras pa
+  }
+  else if (appSleeping()) {
+    // V5.4.2: TULOG ang app - walang ultrasonic distance-keeper (abante/atras); nakahinto lang.
+    // (Ang pit/bangin ay hawak pa rin ng itaas na sangay para sa kaligtasan.)
+    stopBot();
   }
   else {
     bool faceTrackingActive = (millis() - lastFaceCommandTime < FACE_COMMAND_TIMEOUT);
